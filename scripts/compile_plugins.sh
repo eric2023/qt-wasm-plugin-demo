@@ -17,35 +17,20 @@ if ! command -v emcc &> /dev/null; then
     exit 1
 fi
 
-echo "=== Compiling chat_ui_plugin.cpp ==="
+echo "=== Compiling text_editor_plugin.cpp ==="
 
-emcc "$PLUGINS_DIR/chat_ui_plugin.cpp" \
-    -o "$PLUGINS_DIR/chat_ui_plugin.wasm" \
+emcc "$PLUGINS_DIR/text_editor_plugin.cpp" \
+    -o "$PLUGINS_DIR/text_editor_plugin.wasm" \
     -O2 \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
-    -s EXPORTED_FUNCTIONS='["_build_ui","_on_send_clicked","_on_server_message","_on_connected","_on_disconnected","_toggle_theme","_alloc"]' \
+    -s EXPORTED_FUNCTIONS='["_build_ui","_on_text_changed","_on_new_clicked","_on_open_clicked","_on_save_clicked","_toggle_theme","_crash_test","_alloc"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -nostdlib \
     -Wl,--no-entry \
     -Wl,--import-undefined
 
-echo "  → $PLUGINS_DIR/chat_ui_plugin.wasm"
-
-echo ""
-echo "=== Compiling random_reply_plugin.cpp ==="
-
-emcc "$PLUGINS_DIR/random_reply_plugin.cpp" \
-    -o "$PLUGINS_DIR/random_reply_plugin.wasm" \
-    -O2 \
-    -s WASM=1 \
-    -s ALLOW_MEMORY_GROWTH=1 \
-    -s EXPORTED_FUNCTIONS='["_generate_reply","_get_reply_len"]' \
-    -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
-    -nostdlib \
-    -Wl,--no-entry
-
-echo "  → $PLUGINS_DIR/random_reply_plugin.wasm"
+echo "  → $PLUGINS_DIR/text_editor_plugin.wasm"
 
 echo ""
 echo "=== Done! ==="

@@ -1,9 +1,0 @@
-{
-  "name": "wasm-chat",
-  "version": "1.0.0",
-  "description": "WASM-powered Qt chat application with frontend and backend WASM plugin mechanisms",
-  "private": true,
-  "scripts": {
-    "build:plugins": "bash scripts/compile_plugins.sh"
-  }
-}

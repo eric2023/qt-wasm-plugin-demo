@@ -4,9 +4,9 @@
 /**
  * wasm_dtk_host.js — 长驻 Node.js 子进程，作为 WASM 进程插件运行时。
  *
- * 加载用 Emscripten 编译的 C++/Qt WASM 插件。
+ * 加载用 Emscripten 编译的 C++ WASM 插件。
  * WASM 插件声明的 DTK 宿主导入函数（extern "C" 声明，emcc 编译为 import）
- * 由本进程桥接到 C++ 父进程（DTK 客户端）。
+ * 由本进程桥接到 C++ 父进程（DTK 宿主）。
  *
  * 架构：主线程 + Worker 线程
  *   主线程：异步处理 stdin/stdout JSON 行协议（与 C++ 父进程通信）
@@ -17,14 +17,19 @@
  *   Worker 通过 SharedArrayBuffer + Atomics.wait 阻塞等待主线程，
  *   主线程轮询 SharedArrayBuffer 检测 import 请求，转发给 C++，
  *   收到 import_result 后写入 SharedArrayBuffer 并 Atomics.notify 唤醒 Worker。
+ *
+ * 崩溃处理：
+ *   WASM 崩溃（如 unreachable 指令）会导致 Worker 线程抛出异常。
+ *   Worker 的 message handler 捕获异常并通过 'error' 消息通知主线程，
+ *   主线程转发给 C++ 宿主。C++ 宿主可重新加载插件。
  */
 
 const fs = require('fs');
 const path = require('path');
 const { Worker, isMainThread, workerData, parentPort } = require('worker_threads');
 
-// SharedArrayBuffer 布局
-const SAB_SIZE = 8244;
+// SharedArrayBuffer 布局 — 扩展为 131108 字节以支持大文件内容传输
+const SAB_SIZE = 131108;
 const TAG_OFFSET = 0;          // int32: 0=idle, 1=import request
 const FUNCLEN_OFFSET = 4;
 const FUNC_OFFSET = 8;         // max 32 bytes
@@ -32,19 +37,28 @@ const ARG1_OFFSET = 40;
 const ARG2_OFFSET = 44;
 const ARG3_OFFSET = 48;        // int32: 3rd arg (for 3-arg imports)
 const STRLEN_OFFSET = 52;
-const STR_OFFSET = 56;         // max 4096 bytes
-const STR_MAX = 4096;
-const RESULT_OFFSET = 4152;    // int32: return value
-const RESULT_STRLEN_OFFSET = 4156; // int32: result string length
-const RESULT_STR_OFFSET = 4160;    // max 4096 bytes
-const RESULT_STR_MAX = 4096;
+const STR_OFFSET = 56;         // max 65536 bytes (64KB)
+const STR_MAX = 65536;
+const RESULT_OFFSET = 65592;   // int32: return value
+const RESULT_STRLEN_OFFSET = 65596; // int32: result string length
+const RESULT_STR_OFFSET = 65600;    // max 65536 bytes (64KB)
+const RESULT_STR_MAX = 65536;
 
-// 带字符串参数的导入函数集合
+// 带字符串参数的导入函数集合（字符串在 a1/a2 或 a2/a3）
 const STR_FUNCS = new Set([
-    'dtk_create_label', 'dtk_create_lineedit', 'dtk_create_pushbutton',
-    'dtk_set_window_title', 'dtk_append_message',
-    'dtk_set_label_text', 'dtk_send_to_server'
+    'dtk_create_label', 'dtk_create_pushbutton',
+    'dtk_set_window_title',
+    'dtk_set_label_text', 'dtk_set_editor_text',
+    'dtk_read_file', 'dtk_write_file'
 ]);
+
+// 带字符串参数且字符串在 a2/a3（而非 a1/a2）的函数
+const STR_AT_A2_FUNCS = new Set([
+    'dtk_set_label_text', 'dtk_set_editor_text'
+]);
+
+// dtk_read_file 有两个字符串参数: path(a1/a2) 和 data(a3/不预读)
+// dtk_write_file 有两个字符串参数: path(a1/a2) 和 data(a3/result_str)
 
 // ═══════════════════════════════════════════════════════════════
 // Worker 线程：加载并同步执行 WASM
@@ -80,13 +94,13 @@ if (!isMainThread) {
                 i32[ARG3_OFFSET / 4] = a3;
 
                 // 预读字符串参数
-                // dtk_set_label_text(labelId, ptr, len): 字符串在 a2/a3
-                // 其他 STR_FUNCS: 字符串在 a1/a2
                 if (STR_FUNCS.has(funcName) && memory) {
                     let strPtr, strLen;
-                    if (funcName === 'dtk_set_label_text') {
+                    if (STR_AT_A2_FUNCS.has(funcName)) {
+                        // dtk_set_label_text(labelId, ptr, len): 字符串在 a2/a3
                         strPtr = a2; strLen = a3;
                     } else {
+                        // 其他 STR_FUNCS: 字符串在 a1/a2
                         strPtr = a1; strLen = a2;
                     }
                     if (strLen > 0) {
@@ -108,13 +122,18 @@ if (!isMainThread) {
                 Atomics.wait(i32, TAG_OFFSET / 4, 1);
                 const result = Atomics.load(i32, RESULT_OFFSET / 4);
 
-                // dtk_get_input_text: 宿主将输入文本写入 SAB result-string 区域，
-                // Worker 将其复制到 WASM 内存 ptr 位置
-                if (funcName === 'dtk_get_input_text' && memory && result > 0) {
+                // 结果字符串返回：宿主将字符串写入 SAB result-string 区域，
+                // Worker 将其复制到 WASM 内存目标位置
+                // dtk_get_editor_text(ptr, maxlen): a1=dest ptr
+                // dtk_open_file_dialog(ptr, maxlen): a1=dest ptr
+                // dtk_save_file_dialog(ptr, maxlen): a1=dest ptr
+                // dtk_read_file(path, pathLen, destPtr, maxlen): a3=dest ptr
+                if (memory && result > 0) {
                     const rsLen = Atomics.load(i32, RESULT_STRLEN_OFFSET / 4);
                     if (rsLen > 0 && rsLen <= RESULT_STR_MAX) {
                         const rsBytes = u8.subarray(RESULT_STR_OFFSET, RESULT_STR_OFFSET + rsLen);
-                        const wasmMem = new Uint8Array(memory.buffer, a1, rsLen);
+                        const destPtr = (funcName === 'dtk_read_file') ? a3 : a1;
+                        const wasmMem = new Uint8Array(memory.buffer, destPtr, rsLen);
                         wasmMem.set(rsBytes);
                     }
                 }
@@ -123,33 +142,31 @@ if (!isMainThread) {
             };
         }
 
-        // 先读取 WASM 二进制以获取 import 列表
+        // 读取 WASM 二进制
         const wasmBinary = new Uint8Array(fs.readFileSync(wasmPath));
 
-        // 创建一个可变内存引用，供 import 函数读取 WASM 内存
+        // 可变内存引用
         let wasmMemory = null;
         const memoryGetter = () => wasmMemory;
 
         // 构建导入对象
         const dtkFuncs = {};
         const dtkImportNames = [
-            'dtk_create_label', 'dtk_create_textedit', 'dtk_create_lineedit',
-            'dtk_create_pushbutton', 'dtk_create_hbox', 'dtk_add_to_layout',
+            'dtk_create_label', 'dtk_create_textedit', 'dtk_create_pushbutton',
+            'dtk_create_hbox', 'dtk_add_to_layout',
             'dtk_set_window_title', 'dtk_set_window_size',
-            'dtk_get_theme', 'dtk_set_theme', 'dtk_append_message',
-            'dtk_get_input_text', 'dtk_clear_input',
+            'dtk_get_theme', 'dtk_set_theme',
             'dtk_set_label_text', 'dtk_set_widget_enabled',
-            'dtk_send_to_server'
+            'dtk_get_editor_text', 'dtk_set_editor_text',
+            'dtk_get_editor_text_length', 'dtk_clear_editor',
+            'dtk_open_file_dialog', 'dtk_save_file_dialog',
+            'dtk_read_file', 'dtk_write_file'
         ];
         for (const name of dtkImportNames) {
             dtkFuncs[name] = makeDtkImport(name, memoryGetter);
         }
 
-        // 使用 WebAssembly 直接实例化（不依赖 Emscripten JS 胶水）
-        // 因为我们用 -nostdlib -noentry，WASM 是纯模块，无 JS 运行时依赖
         const importObject = { env: dtkFuncs };
-
-        // 也尝试 'dtk' 模块名（取决于 emcc 的 import 路径）
         const importObjectBoth = { env: dtkFuncs, dtk: dtkFuncs };
 
         let instance;
@@ -161,7 +178,6 @@ if (!isMainThread) {
                 const result = await WebAssembly.instantiate(wasmBinary, importObjectBoth);
                 instance = result.instance || result;
             } catch (e2) {
-                // 自动检测 import 模块名
                 const module = await WebAssembly.compile(wasmBinary);
                 const imports = WebAssembly.Module.imports(module);
                 const importMap = {};
@@ -201,7 +217,8 @@ if (!isMainThread) {
                     process.exit(0);
                 }
             } catch (e) {
-                parentPort.postMessage({ type: 'error', error: e.message });
+                // WASM 崩溃（如 unreachable）会抛出 RuntimeError
+                parentPort.postMessage({ type: 'error', error: 'WASM crash: ' + e.message, crash: true });
             }
         });
     }
@@ -215,10 +232,8 @@ if (!isMainThread) {
 // 主线程：处理 stdin/stdout IPC，转发 import 请求
 // ═══════════════════════════════════════════════════════════════
 
-    // 参数: wasm_dtk_host.js <wasm_dir> <wasm_name>
-    // wasm_name 是不含扩展名的基础名（如 "chat_ui_plugin"）
     const wasmDir = process.argv[2] || 'plugins';
-    const wasmName = process.argv[3] || 'chat_ui_plugin';
+    const wasmName = process.argv[3] || 'text_editor_plugin';
 
     const sab = new SharedArrayBuffer(SAB_SIZE);
     const i32 = new Int32Array(sab);
@@ -244,11 +259,14 @@ if (!isMainThread) {
 
     worker.on('error', (err) => {
         process.stderr.write(`[wasm_dtk_host] Worker error: ${err.message}\n`);
-        sendToParent({ type: 'error', error: 'Worker error: ' + err.message });
+        sendToParent({ type: 'error', error: 'Worker error: ' + err.message, crash: true });
     });
 
     worker.on('exit', (code) => {
         process.stderr.write(`[wasm_dtk_host] Worker exited with code ${code}\n`);
+        if (code !== 0) {
+            sendToParent({ type: 'error', error: 'Worker exited unexpectedly (code ' + code + ')', crash: true });
+        }
     });
 
     function pollImport() {
@@ -286,7 +304,6 @@ if (!isMainThread) {
             if (waitingImportResult) {
                 const value = req.value || 0;
                 Atomics.store(i32, RESULT_OFFSET / 4, value);
-                // 如果 C++ 附带了结果字符串，写入 SAB result-string 区域
                 if (req.str) {
                     const strBytes = Buffer.from(req.str, 'utf8');
                     const strLen = Math.min(strBytes.length, RESULT_STR_MAX);
