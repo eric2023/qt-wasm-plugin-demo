@@ -24,7 +24,7 @@ emcc "$PLUGINS_DIR/text_editor_plugin.cpp" \
     -O2 \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
-    -s EXPORTED_FUNCTIONS='["_build_ui","_on_text_changed","_on_new_clicked","_on_open_clicked","_on_save_clicked","_toggle_theme","_crash_test","_alloc"]' \
+    -s EXPORTED_FUNCTIONS='["_build_ui","_on_event","_alloc"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -nostdlib \
     -Wl,--no-entry \

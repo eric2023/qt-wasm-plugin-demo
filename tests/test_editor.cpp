@@ -10,20 +10,22 @@
 /**
  * test_editor.cpp — WASM 文本编辑器插件冒烟测试（非 GUI）。
  *
- * 直接通过 Node.js IPC 测试 WASM 插件：
+ * 直接通过 Node.js IPC 测试 WASM 事件驱动架构：
  *   1. 加载 WASM 插件，调用 build_ui()
- *   2. 验证 import 调用序列正确
- *   3. 调用 crash_test()，验证子进程崩溃
+ *      → 验证 import 调用包含 dtk_subscribe_event 和 dtk_add_context_menu_item
+ *   2. 调用 on_event(EVT_TOGGLE_THEME=6, 0) — 验证事件分发
+ *   3. 调用 on_event(EVT_CRASH_CLICKED=4, 0) — 触发 WASM 崩溃
  *   4. 验证主进程（测试程序）仍在运行
  *
- * 这验证了进程隔离的核心价值：WASM 崩溃不影响主程序。
+ * 事件 ID 由 WASM 插件定义（build_ui 中 subscribe/register 时传入）：
+ *   1=New, 2=Open, 3=Save, 4=Crash, 5=TextChanged, 6=ToggleTheme
  */
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
 
     QTextStream out(stdout);
-    out << "=== WASM Text Editor Plugin Test ===" << Qt::endl;
+    out << "=== WASM Text Editor Plugin Test (Event-Driven) ===" << Qt::endl;
 
     QProcess node;
     node.setProgram("node");
@@ -43,52 +45,10 @@ int main(int argc, char *argv[])
     out << "[INFO] stderr: " << QString::fromUtf8(stderrData).trimmed() << Qt::endl;
     node.setReadChannel(QProcess::StandardOutput);
 
-    // 辅助函数：发送 JSON 并读取响应
-    auto sendJson = [&](const QJsonObject &obj) -> QJsonObject {
-        QByteArray line = QJsonDocument(obj).toJson(QJsonDocument::Compact);
-        line.append('\n');
-        node.write(line);
-        node.waitForBytesWritten(2000);
-
-        // 读取响应（可能包含多个 import 请求）
-        while (true) {
-            // 等待一行
-            QByteArray accum;
-            while (accum.indexOf('\n') < 0) {
-                if (!node.waitForReadyRead(10000)) return {};
-                accum += node.readAll();
-            }
-            int nl = accum.indexOf('\n');
-            QByteArray respLine = accum.left(nl).trimmed();
-
-            QJsonParseError parseError;
-            QJsonDocument doc = QJsonDocument::fromJson(respLine, &parseError);
-            if (parseError.error != QJsonParseError::NoError) continue;
-
-            QJsonObject msg = doc.object();
-            QString type = msg.value("type").toString();
-
-            if (type == "call_result") {
-                return msg;
-            } else if (type == "import") {
-                // 处理 import 请求 — 返回简单的模拟值
-                QString func = msg.value("func").toString();
-                QJsonObject result;
-                result["type"] = "import_result";
-                result["value"] = 1; // 返回控件 ID=1
-                QByteArray resultLine = QJsonDocument(result).toJson(QJsonDocument::Compact);
-                resultLine.append('\n');
-                node.write(resultLine);
-                node.waitForBytesWritten(2000);
-            } else if (type == "error") {
-                return msg;
-            }
-        }
-    };
-
     int importCount = 0;
+    QStringList importFuncs;
 
-    // 改进版 sendJson，统计 import 数
+    // 发送 JSON 请求，处理中间的 import 请求，统计 import 数
     auto sendJsonCount = [&](const QJsonObject &obj) -> QJsonObject {
         QByteArray line = QJsonDocument(obj).toJson(QJsonDocument::Compact);
         line.append('\n');
@@ -116,6 +76,7 @@ int main(int argc, char *argv[])
             } else if (type == "import") {
                 importCount++;
                 QString func = msg.value("func").toString();
+                importFuncs << func;
                 out << "  [import #" << importCount << "] " << func << Qt::endl;
 
                 QJsonObject result;
@@ -152,24 +113,41 @@ int main(int argc, char *argv[])
     }
     out << "[OK] Import count looks correct" << Qt::endl;
 
-    // 测试 2: toggle_theme()
-    out << Qt::endl << "[TEST 2] Calling toggle_theme()..." << Qt::endl;
+    // 验证事件驱动架构：build_ui 中应包含 dtk_subscribe_event 和 dtk_add_context_menu_item
+    bool hasSubscribe = importFuncs.contains("dtk_subscribe_event");
+    bool hasMenuItem = importFuncs.contains("dtk_add_context_menu_item");
+    out << "  → dtk_subscribe_event calls: "
+        << importFuncs.filter("dtk_subscribe_event").size() << Qt::endl;
+    out << "  → dtk_add_context_menu_item calls: "
+        << importFuncs.filter("dtk_add_context_menu_item").size() << Qt::endl;
+    if (!hasSubscribe) {
+        out << "[FAIL] build_ui() did not call dtk_subscribe_event" << Qt::endl;
+        return 1;
+    }
+    if (!hasMenuItem) {
+        out << "[FAIL] build_ui() did not call dtk_add_context_menu_item" << Qt::endl;
+        return 1;
+    }
+    out << "[OK] Event-driven architecture verified (subscribe + menu registration)" << Qt::endl;
+
+    // 测试 2: on_event(EVT_TOGGLE_THEME=6, 0) — 通过通用事件入口切换主题
+    out << Qt::endl << "[TEST 2] Calling on_event(6, 0) — toggle theme..." << Qt::endl;
     importCount = 0;
     QJsonObject themeReq;
     themeReq["type"] = "call";
-    themeReq["func"] = "toggle_theme";
-    themeReq["args"] = QJsonArray();
+    themeReq["func"] = "on_event";
+    themeReq["args"] = QJsonArray{ 6, 0 }; // eventId=6 (toggle_theme), widgetId=0
     resp = sendJsonCount(themeReq);
-    out << "[OK] toggle_theme() returned: " << resp.value("value").toInt()
+    out << "[OK] on_event(6, 0) returned: " << resp.value("value").toInt()
         << " (" << importCount << " imports)" << Qt::endl;
 
-    // 测试 3: crash_test() — WASM 崩溃
-    out << Qt::endl << "[TEST 3] Calling crash_test()..." << Qt::endl;
+    // 测试 3: on_event(EVT_CRASH_CLICKED=4, 0) — 通过通用事件入口触发崩溃
+    out << Qt::endl << "[TEST 3] Calling on_event(4, 0) — crash test..." << Qt::endl;
     out << "  → Expecting WASM crash (unreachable instruction)" << Qt::endl;
     QJsonObject crashReq;
     crashReq["type"] = "call";
-    crashReq["func"] = "crash_test";
-    crashReq["args"] = QJsonArray();
+    crashReq["func"] = "on_event";
+    crashReq["args"] = QJsonArray{ 4, 0 }; // eventId=4 (crash), widgetId=0
     resp = sendJsonCount(crashReq);
 
     // 检查是否收到 error（崩溃）
@@ -178,7 +156,7 @@ int main(int argc, char *argv[])
     } else if (resp.isEmpty()) {
         out << "[OK] WASM process crashed (no response — process died)" << Qt::endl;
     } else {
-        out << "[WARN] crash_test returned normally: " << resp.value("value").toInt() << Qt::endl;
+        out << "[WARN] on_event(4, 0) returned normally: " << resp.value("value").toInt() << Qt::endl;
     }
 
     // 测试 4: 验证主进程仍在运行

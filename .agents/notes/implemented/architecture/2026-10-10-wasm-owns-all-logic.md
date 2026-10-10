@@ -12,10 +12,11 @@ Status: implemented
 
 将**文本编辑器的全部功能逻辑移入 WASM 插件**，C++ 客户端变为纯展示宿主。
 
-### DTK 宿主导入函数（18 个）
+### DTK 宿主导入函数（20 个）
 
 | 类别 | 函数 | 用途 |
 |------|------|------|
+| 事件驱动核心 | `dtk_subscribe_event`, `dtk_add_context_menu_item` | 订阅控件事件、注册右键菜单项 |
 | 控件创建 | `dtk_create_label`, `dtk_create_textedit`, `dtk_create_pushbutton`, `dtk_create_hbox` | 创建 DTK 控件 |
 | 布局 | `dtk_add_to_layout` | 将控件添加到布局 |
 | 窗口 | `dtk_set_window_title`, `dtk_set_window_size` | 设置窗口属性 |
@@ -24,38 +25,28 @@ Status: implemented
 | 编辑器 | `dtk_get_editor_text`, `dtk_set_editor_text`, `dtk_get_editor_text_length`, `dtk_clear_editor` | 读写编辑器文本 |
 | 文件 I/O | `dtk_open_file_dialog`, `dtk_save_file_dialog`, `dtk_read_file`, `dtk_write_file` | 文件对话框和读写 |
 
-### WASM 导出函数（8 个）
+### WASM 导出函数（3 个）
 
 | 函数 | WASM 逻辑 |
 |------|-----------|
-| `build_ui()` | 创建全部 UI 控件（标题/状态标签、工具栏、4 个按钮、编辑区） |
-| `on_text_changed()` | 标记已修改 |
-| `on_new_clicked()` | 清空编辑器 → 更新状态 |
-| `on_open_clicked()` | 文件对话框 → 读取文件 → 设置编辑器文本 → 更新状态 |
-| `on_save_clicked()` | 获取文本 → 文件对话框 → 写入文件 → 更新状态 |
-| `toggle_theme()` | 获取当前主题 → 切换 |
-| `crash_test()` | 触发 `unreachable` 指令崩溃 |
+| `build_ui()` | 创建全部 UI 控件，通过 `dtk_subscribe_event` 订阅事件，通过 `dtk_add_context_menu_item` 注册右键菜单项 |
+| `on_event(eventId, widgetId)` | 通用事件入口——内部根据 eventId 分发到处理逻辑（新建/打开/保存/崩溃/主题） |
 | `alloc(size)` | WASM 线性内存 bump 分配器 |
 
-### C++ 客户端变为纯转发层
+### C++ 客户端为纯展示宿主
 
-| 事件 | C++ 动作（仅转发） |
-|------|-------------------|
-| 用户点击 New | `callExport("on_new_clicked")` |
-| 用户点击 Open | `callExport("on_open_clicked")` |
-| 用户点击 Save | `callExport("on_save_clicked")` |
-| 用户点击 Crash Test | `callExport("crash_test")` + 检测 `isAlive()` |
-| 编辑器文本变化 | `callExport("on_text_changed")` |
-| 主题切换 | `callExport("toggle_theme")` |
+宿主只调用三个导出函数（`build_ui`/`on_event`/`alloc`），不包含任何插件业务函数名。
+事件触发时宿主调用 `callExport_ii("on_event", eventId, widgetId)` —— 唯一的通用事件入口。
 
 ### 崩溃恢复机制
 
-`crash_test()` 触发 WASM `unreachable` 指令 → Worker `RuntimeError` → 子进程退出。
-C++ 宿主检测到 `isAlive() == false` 后：
+`on_event(crashEventId, 0)` 触发 WASM `unreachable` 指令 → Worker `RuntimeError` → 子进程退出。
+C++ 宿主在 `callExport_ii` 返回后检测 `isAlive() == false`，然后：
 1. 清理旧控件（删除所有 DLabel/DTextEdit/按钮）
-2. 重置控件 ID 计数器
-3. 重新调用 `loadWasmPlugin()` 加载 WASM 插件
-4. 显示恢复消息
+2. 清空事件映射表和菜单项
+3. 重置控件 ID 计数器
+4. 重新调用 `loadWasmPlugin()` 加载 WASM 插件
+5. 显示恢复消息
 
 ### SharedArrayBuffer 布局（131108 字节）
 
@@ -92,4 +83,5 @@ WASM 负责交互逻辑（何时读取/保存、读取/保存什么），宿主�
 - `dtk_read_file` 的目标 `ptr` 在 `a3`（而非 `a1`），Worker 端特殊处理 result-str 复制目标。
 - `dtk_set_editor_text` 设置文本时阻塞 `textChanged` 信号，避免回调 WASM 形成循环。
 - 崩溃恢复机制确保 WASM 崩溃后主程序可自动恢复。
-- 验证：冒烟测试通过——build_ui（19 次 import）、toggle_theme（2 次 import）、crash_test（崩溃后主程序存活）。
+- 事件驱动架构确保三方换插件时宿主源码零修改——参见 [事件驱动架构](2026-10-10-event-driven-plugin-architecture.md)。
+- 验证：冒烟测试通过——build_ui（25 次 import，含 5 次 subscribe + 1 次 add_menu_item）、on_event(6,0) 切换主题（3 次 import）、on_event(4,0) 崩溃（主程序存活）。

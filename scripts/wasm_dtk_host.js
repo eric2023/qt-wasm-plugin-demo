@@ -49,7 +49,8 @@ const STR_FUNCS = new Set([
     'dtk_create_label', 'dtk_create_pushbutton',
     'dtk_set_window_title',
     'dtk_set_label_text', 'dtk_set_editor_text',
-    'dtk_read_file', 'dtk_write_file'
+    'dtk_read_file', 'dtk_write_file',
+    'dtk_add_context_menu_item'
 ]);
 
 // 带字符串参数且字符串在 a2/a3（而非 a1/a2）的函数
@@ -160,7 +161,8 @@ if (!isMainThread) {
             'dtk_get_editor_text', 'dtk_set_editor_text',
             'dtk_get_editor_text_length', 'dtk_clear_editor',
             'dtk_open_file_dialog', 'dtk_save_file_dialog',
-            'dtk_read_file', 'dtk_write_file'
+            'dtk_read_file', 'dtk_write_file',
+            'dtk_subscribe_event', 'dtk_add_context_menu_item'
         ];
         for (const name of dtkImportNames) {
             dtkFuncs[name] = makeDtkImport(name, memoryGetter);

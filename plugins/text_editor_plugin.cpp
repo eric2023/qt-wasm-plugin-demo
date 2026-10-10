@@ -1,18 +1,27 @@
 /**
  * text_editor_plugin.cpp — WASM 进程插件源码（C++ 编译为 WASM）
  *
- * 文本编辑器的全部功能逻辑在 WASM 内实现：
- *   - UI 布局构建（build_ui）
- *   - 文本修改处理（on_text_changed）
- *   - 新建文件（on_new_clicked）
- *   - 打开文件（on_open_clicked）
- *   - 保存文件（on_save_clicked）
- *   - 主题切换（toggle_theme）
- *   - 崩溃测试（crash_test — 验证进程隔离）
+ * 文本编辑器的全部功能逻辑在 WASM 内实现，采用事件驱动架构：
+ *   - build_ui() 创建 UI 并通过 dtk_subscribe_event 订阅控件事件
+ *   - on_event(eventId, widgetId) 是唯一的事件入口，WASM 内部分发
+ *   - 宿主不知道任何业务函数名——完全通过通用事件 ID 通信
+ *
+ * 事件 ID 约定（由 WASM 插件定义，宿主仅转发）：
+ *   1 = New button clicked
+ *   2 = Open button clicked
+ *   3 = Save button clicked
+ *   4 = Crash Test button clicked
+ *   5 = Editor text changed
+ *   6 = Context menu: Toggle Theme
+ *
+ * 事件类型约定（传给 dtk_subscribe_event）：
+ *   1 = clicked (DPushButton)
+ *   2 = textChanged (DTextEdit)
  *
  * 编译：emcc -nostdlib -noentry --import-undefined
- * WASM 模块声明 17 个 DTK 宿主导入函数（env 模块），
+ * WASM 模块声明 20 个 DTK 宿主导入函数（env 模块），
  * 无 DTK 宿主则无法实例化（LinkError）。
+ * 导出 3 个函数（build_ui / on_event / alloc）——宿主编译时无需知道任何业务函数名。
  */
 
 #include <cstdint>
@@ -33,7 +42,7 @@ static void my_memcpy(void* dst, const void* src, uint32_t n) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DTK 宿主导入函数声明（17 个）
+// DTK 宿主导入函数声明（20 个）
 // ═══════════════════════════════════════════════════════════════
 
 extern "C" {
@@ -59,6 +68,15 @@ extern "C" {
 
     // 启用/禁用控件
     int32_t dtk_set_widget_enabled(int32_t widgetId, int32_t enabled);
+
+    // ── 事件驱动架构核心导入 ──
+
+    // 订阅控件事件：当 widgetId 的 eventType 事件发生时，宿主调用 on_event(eventId, widgetId)
+    // eventType: 1=clicked, 2=textChanged
+    int32_t dtk_subscribe_event(int32_t widgetId, int32_t eventType, int32_t eventId);
+
+    // 注册右键菜单项：用户点击后宿主调用 on_event(eventId, 0)
+    int32_t dtk_add_context_menu_item(const char* label, int32_t len, int32_t eventId);
 
     // ── 文本编辑器专用导入 ──
 
@@ -95,6 +113,7 @@ static const char STR_NEW[]           = "New";
 static const char STR_OPEN[]          = "Open";
 static const char STR_SAVE[]          = "Save";
 static const char STR_CRASH[]         = "Crash Test";
+static const char STR_CTX_TOGGLE_THEME[] = "Toggle Theme";
 static const char STR_STATUS_NEW[]    = "New file — unsaved";
 static const char STR_STATUS_OPENED[] = "Opened: ";
 static const char STR_STATUS_SAVED[]  = "Saved: ";
@@ -103,8 +122,23 @@ static const char STR_STATUS_SAVE_CANCEL[] = "Save cancelled";
 static const char STR_STATUS_OPEN_ERR[]    = "Error opening file";
 static const char STR_STATUS_SAVE_ERR[]    = "Error saving file";
 static const char STR_STATUS_EMPTY[]  = "Editor is empty — nothing to save";
-static const char STR_STATUS_CRASHED[] = "WASM plugin crashed! But main app survived. Reloading plugin...";
 static const char STR_CRASH_MSG[]     = "[CRASH TEST] About to trigger WASM unreachable instruction...";
+
+// 事件 ID（由 WASM 插件定义）
+enum EventId : int32_t {
+    EVT_NEW_CLICKED     = 1,
+    EVT_OPEN_CLICKED    = 2,
+    EVT_SAVE_CLICKED    = 3,
+    EVT_CRASH_CLICKED   = 4,
+    EVT_TEXT_CHANGED    = 5,
+    EVT_TOGGLE_THEME    = 6,
+};
+
+// 事件类型
+enum EventType : int32_t {
+    EVT_TYPE_CLICKED    = 1,
+    EVT_TYPE_TEXT_CHANGED = 2,
+};
 
 // 控件 ID — WASM 管理全部 UI 状态
 static int32_t g_mainLayout   = 0;
@@ -120,8 +154,106 @@ static int32_t g_crashButton  = 0;
 // 文件状态
 static bool g_modified = false;
 
+// 前向声明 alloc（定义在导出函数区域，但内部处理函数需要调用）
+extern "C" __attribute__((visibility("default"))) uint32_t alloc(uint32_t size);
+
 // ═══════════════════════════════════════════════════════════════
-// 导出函数
+// 内部处理函数（由 on_event 分发调用）
+// ═══════════════════════════════════════════════════════════════
+
+static void handle_new() {
+    dtk_clear_editor();
+    g_modified = false;
+    dtk_set_label_text(g_statusLabel, STR_STATUS_NEW, (int32_t)my_strlen(STR_STATUS_NEW));
+}
+
+static void handle_open() {
+    uint32_t pathBuf = alloc(4096);
+    int32_t pathLen = dtk_open_file_dialog(pathBuf, 4096);
+    if (pathLen <= 0) {
+        dtk_set_label_text(g_statusLabel, STR_STATUS_OPEN_CANCEL,
+                           (int32_t)my_strlen(STR_STATUS_OPEN_CANCEL));
+        return;
+    }
+
+    uint32_t contentBuf = alloc(65536);
+    int32_t contentLen = dtk_read_file((const char*)(uintptr_t)pathBuf, pathLen,
+                                       contentBuf, 65536);
+    if (contentLen < 0) {
+        dtk_set_label_text(g_statusLabel, STR_STATUS_OPEN_ERR,
+                           (int32_t)my_strlen(STR_STATUS_OPEN_ERR));
+        return;
+    }
+
+    dtk_set_editor_text((const char*)(uintptr_t)contentBuf, contentLen);
+
+    uint32_t prefixLen = my_strlen(STR_STATUS_OPENED);
+    uint32_t statusLen = prefixLen + (uint32_t)pathLen;
+    uint32_t statusPtr = alloc(statusLen);
+    my_memcpy((void*)(uintptr_t)statusPtr, STR_STATUS_OPENED, prefixLen);
+    my_memcpy((void*)(uintptr_t)(statusPtr + prefixLen),
+              (void*)(uintptr_t)pathBuf, (uint32_t)pathLen);
+    dtk_set_label_text(g_statusLabel, (const char*)(uintptr_t)statusPtr, (int32_t)statusLen);
+
+    g_modified = false;
+}
+
+static void handle_save() {
+    int32_t textLen = dtk_get_editor_text_length();
+    if (textLen <= 0) {
+        dtk_set_label_text(g_statusLabel, STR_STATUS_EMPTY,
+                           (int32_t)my_strlen(STR_STATUS_EMPTY));
+        return;
+    }
+
+    uint32_t textBuf = alloc((uint32_t)textLen + 1);
+    int32_t actualLen = dtk_get_editor_text(textBuf, textLen);
+    if (actualLen < 0) actualLen = 0;
+
+    uint32_t pathBuf = alloc(4096);
+    int32_t pathLen = dtk_save_file_dialog(pathBuf, 4096);
+    if (pathLen <= 0) {
+        dtk_set_label_text(g_statusLabel, STR_STATUS_SAVE_CANCEL,
+                           (int32_t)my_strlen(STR_STATUS_SAVE_CANCEL));
+        return;
+    }
+
+    int32_t result = dtk_write_file((const char*)(uintptr_t)pathBuf, pathLen,
+                                    (const char*)(uintptr_t)textBuf, actualLen);
+    if (result != 0) {
+        dtk_set_label_text(g_statusLabel, STR_STATUS_SAVE_ERR,
+                           (int32_t)my_strlen(STR_STATUS_SAVE_ERR));
+        return;
+    }
+
+    uint32_t prefixLen = my_strlen(STR_STATUS_SAVED);
+    uint32_t statusLen = prefixLen + (uint32_t)pathLen;
+    uint32_t statusPtr = alloc(statusLen);
+    my_memcpy((void*)(uintptr_t)statusPtr, STR_STATUS_SAVED, prefixLen);
+    my_memcpy((void*)(uintptr_t)(statusPtr + prefixLen),
+              (void*)(uintptr_t)pathBuf, (uint32_t)pathLen);
+    dtk_set_label_text(g_statusLabel, (const char*)(uintptr_t)statusPtr, (int32_t)statusLen);
+
+    g_modified = false;
+}
+
+static void handle_crash() {
+    dtk_set_label_text(g_statusLabel, STR_CRASH_MSG,
+                       (int32_t)my_strlen(STR_CRASH_MSG));
+    __builtin_unreachable();
+}
+
+static void handle_toggle_theme() {
+    int32_t current = dtk_get_theme();
+    if (current == 0) {
+        dtk_set_theme(1, 0);
+    } else {
+        dtk_set_theme(0, 0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 导出函数（仅 3 个——宿主编译时无需知道任何业务函数名）
 // ═══════════════════════════════════════════════════════════════
 
 /**
@@ -144,8 +276,10 @@ uint32_t alloc(uint32_t size) {
 }
 
 /**
- * build_ui() — 创建全部 UI 控件，保存控件 ID。
+ * build_ui() — 创建全部 UI 控件，订阅事件，注册右键菜单项。
  * 返回主布局 ID。
+ *
+ * 这是唯一在初始化时被宿主调用的导出函数（名称固定）。
  */
 extern "C" __attribute__((visibility("default")))
 int32_t build_ui() {
@@ -180,147 +314,40 @@ int32_t build_ui() {
     g_editor = dtk_create_textedit(0, 0);
     dtk_add_to_layout(g_mainLayout, g_editor);
 
+    // ── 订阅控件事件（事件驱动架构核心） ──
+    // 宿主收到 subscribe 后连接 Qt 信号，事件触发时调用 on_event(eventId, widgetId)
+    dtk_subscribe_event(g_newButton, EVT_TYPE_CLICKED, EVT_NEW_CLICKED);
+    dtk_subscribe_event(g_openButton, EVT_TYPE_CLICKED, EVT_OPEN_CLICKED);
+    dtk_subscribe_event(g_saveButton, EVT_TYPE_CLICKED, EVT_SAVE_CLICKED);
+    dtk_subscribe_event(g_crashButton, EVT_TYPE_CLICKED, EVT_CRASH_CLICKED);
+    dtk_subscribe_event(g_editor, EVT_TYPE_TEXT_CHANGED, EVT_TEXT_CHANGED);
+
+    // ── 注册右键菜单项 ──
+    dtk_add_context_menu_item(STR_CTX_TOGGLE_THEME, (int32_t)my_strlen(STR_CTX_TOGGLE_THEME),
+                              EVT_TOGGLE_THEME);
+
     return g_mainLayout;
 }
 
 /**
- * on_text_changed() — 编辑器文本发生变化。
- * WASM 标记为已修改，更新状态标签。
+ * on_event(eventId, widgetId) — 通用事件入口。
+ * 宿主通过此函数通知 WASM 插件发生了事件。
+ * WASM 内部根据 eventId 分发到对应处理函数。
+ *
+ * eventId 由 WASM 插件在 subscribe_event / add_context_menu_item 时定义。
+ * widgetId 是触发事件的控件 ID（右键菜单项为 0）。
  */
 extern "C" __attribute__((visibility("default")))
-int32_t on_text_changed() {
-    g_modified = true;
-    // 状态由具体操作更新，这里仅标记
-    return 0;
-}
-
-/**
- * on_new_clicked() — 新建文件。
- * WASM 负责全部逻辑：清空编辑器、更新状态。
- */
-extern "C" __attribute__((visibility("default")))
-int32_t on_new_clicked() {
-    dtk_clear_editor();
-    g_modified = false;
-    dtk_set_label_text(g_statusLabel, STR_STATUS_NEW, (int32_t)my_strlen(STR_STATUS_NEW));
-    return 0;
-}
-
-/**
- * on_open_clicked() — 打开文件。
- * WASM 负责全部逻辑：文件对话框 → 读取文件 → 设置编辑器文本 → 更新状态。
- */
-extern "C" __attribute__((visibility("default")))
-int32_t on_open_clicked() {
-    // 1. 弹出文件对话框，获取文件路径
-    uint32_t pathBuf = alloc(4096);
-    int32_t pathLen = dtk_open_file_dialog(pathBuf, 4096);
-    if (pathLen <= 0) {
-        dtk_set_label_text(g_statusLabel, STR_STATUS_OPEN_CANCEL,
-                           (int32_t)my_strlen(STR_STATUS_OPEN_CANCEL));
-        return 0;
+int32_t on_event(int32_t eventId, int32_t widgetId) {
+    (void)widgetId; // 当前不需要 widgetId，eventId 足够区分
+    switch (eventId) {
+        case EVT_NEW_CLICKED:   handle_new();          break;
+        case EVT_OPEN_CLICKED:  handle_open();         break;
+        case EVT_SAVE_CLICKED:  handle_save();         break;
+        case EVT_CRASH_CLICKED: handle_crash();        break;
+        case EVT_TEXT_CHANGED:  g_modified = true;     break;
+        case EVT_TOGGLE_THEME:  handle_toggle_theme(); break;
+        default: break;
     }
-
-    // 2. 读取文件内容到 WASM 内存
-    uint32_t contentBuf = alloc(65536);
-    int32_t contentLen = dtk_read_file((const char*)(uintptr_t)pathBuf, pathLen,
-                                       contentBuf, 65536);
-    if (contentLen < 0) {
-        dtk_set_label_text(g_statusLabel, STR_STATUS_OPEN_ERR,
-                           (int32_t)my_strlen(STR_STATUS_OPEN_ERR));
-        return 0;
-    }
-
-    // 3. 设置编辑器文本
-    dtk_set_editor_text((const char*)(uintptr_t)contentBuf, contentLen);
-
-    // 4. 更新状态：显示 "Opened: <路径>"
-    uint32_t prefixLen = my_strlen(STR_STATUS_OPENED);
-    uint32_t statusLen = prefixLen + (uint32_t)pathLen;
-    uint32_t statusPtr = alloc(statusLen);
-    my_memcpy((void*)(uintptr_t)statusPtr, STR_STATUS_OPENED, prefixLen);
-    my_memcpy((void*)(uintptr_t)(statusPtr + prefixLen),
-              (void*)(uintptr_t)pathBuf, (uint32_t)pathLen);
-    dtk_set_label_text(g_statusLabel, (const char*)(uintptr_t)statusPtr, (int32_t)statusLen);
-
-    g_modified = false;
-    return 0;
-}
-
-/**
- * on_save_clicked() — 保存文件。
- * WASM 负责全部逻辑：获取编辑器文本 → 文件对话框 → 写入文件 → 更新状态。
- */
-extern "C" __attribute__((visibility("default")))
-int32_t on_save_clicked() {
-    // 1. 获取编辑器文本长度
-    int32_t textLen = dtk_get_editor_text_length();
-    if (textLen <= 0) {
-        dtk_set_label_text(g_statusLabel, STR_STATUS_EMPTY,
-                           (int32_t)my_strlen(STR_STATUS_EMPTY));
-        return 0;
-    }
-
-    // 2. 获取编辑器文本到 WASM 内存
-    uint32_t textBuf = alloc((uint32_t)textLen + 1);
-    int32_t actualLen = dtk_get_editor_text(textBuf, textLen);
-    if (actualLen < 0) actualLen = 0;
-
-    // 3. 弹出保存文件对话框，获取文件路径
-    uint32_t pathBuf = alloc(4096);
-    int32_t pathLen = dtk_save_file_dialog(pathBuf, 4096);
-    if (pathLen <= 0) {
-        dtk_set_label_text(g_statusLabel, STR_STATUS_SAVE_CANCEL,
-                           (int32_t)my_strlen(STR_STATUS_SAVE_CANCEL));
-        return 0;
-    }
-
-    // 4. 写入文件
-    int32_t result = dtk_write_file((const char*)(uintptr_t)pathBuf, pathLen,
-                                    (const char*)(uintptr_t)textBuf, actualLen);
-    if (result != 0) {
-        dtk_set_label_text(g_statusLabel, STR_STATUS_SAVE_ERR,
-                           (int32_t)my_strlen(STR_STATUS_SAVE_ERR));
-        return 0;
-    }
-
-    // 5. 更新状态：显示 "Saved: <路径>"
-    uint32_t prefixLen = my_strlen(STR_STATUS_SAVED);
-    uint32_t statusLen = prefixLen + (uint32_t)pathLen;
-    uint32_t statusPtr = alloc(statusLen);
-    my_memcpy((void*)(uintptr_t)statusPtr, STR_STATUS_SAVED, prefixLen);
-    my_memcpy((void*)(uintptr_t)(statusPtr + prefixLen),
-              (void*)(uintptr_t)pathBuf, (uint32_t)pathLen);
-    dtk_set_label_text(g_statusLabel, (const char*)(uintptr_t)statusPtr, (int32_t)statusLen);
-
-    g_modified = false;
-    return 0;
-}
-
-/**
- * toggle_theme() — 获取当前主题并切换。
- */
-extern "C" __attribute__((visibility("default")))
-int32_t toggle_theme() {
-    int32_t current = dtk_get_theme();
-    if (current == 0) {
-        dtk_set_theme(1, 0);
-    } else {
-        dtk_set_theme(0, 0);
-    }
-    return current;
-}
-
-/**
- * crash_test() — 触发 WASM 崩溃（unreachable 指令）。
- * 验证进程隔离：WASM 子进程崩溃后主程序仍可运行。
- */
-extern "C" __attribute__((visibility("default")))
-int32_t crash_test() {
-    // 先显示提示消息（通过 dtk_set_label_text）
-    dtk_set_label_text(g_statusLabel, STR_CRASH_MSG,
-                       (int32_t)my_strlen(STR_CRASH_MSG));
-    // 触发 unreachable 指令 — WASM Runtime Error
-    __builtin_unreachable();
     return 0;
 }
