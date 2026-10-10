@@ -3,4 +3,5 @@ node_modules/
 *.o
 emsdk/
 *.tar.xz
+*.wasm
 !.agents/
