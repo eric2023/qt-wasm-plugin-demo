@@ -24,7 +24,7 @@ emcc "$PLUGINS_DIR/chat_ui_plugin.cpp" \
     -O2 \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
-    -s EXPORTED_FUNCTIONS='["_build_ui","_format_message","_toggle_theme","_alloc"]' \
+    -s EXPORTED_FUNCTIONS='["_build_ui","_on_send_clicked","_on_server_message","_on_connected","_on_disconnected","_toggle_theme","_alloc"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -nostdlib \
     -Wl,--no-entry \

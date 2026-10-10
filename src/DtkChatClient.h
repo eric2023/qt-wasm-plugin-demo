@@ -83,8 +83,8 @@ public:
         m_mainLayout->setSpacing(6);
 
         // 设置 DTK 宿主回调 — WASM 插件通过 IPC 调用此函数创建 DTK 控件
-        WasmProcessBridge::s_hostCallback = [this](const QString &func, int32_t a1, int32_t a2, const QString &str) -> int32_t {
-            return this->handleDtkHostCall(func, a1, a2, str);
+        WasmProcessBridge::s_hostCallback = [this](const QString &func, int32_t a1, int32_t a2, int32_t a3, const QString &str, QString &outResultStr) -> int32_t {
+            return this->handleDtkHostCall(func, a1, a2, a3, str, outResultStr);
         };
 
         // 通过进程插件加载 WASM UI 插件
@@ -150,7 +150,7 @@ private:
      * DTK 宿主回调 — 处理 WASM 插件通过 IPC 转发的 DTK 导入函数调用。
      * func 是导入函数名（如 "dtk_create_label"），a1/a2 是参数。
      */
-    int32_t handleDtkHostCall(const QString &func, int32_t a1, int32_t a2, const QString &str)
+    int32_t handleDtkHostCall(const QString &func, int32_t a1, int32_t a2, int32_t a3, const QString &str, QString &outResultStr)
     {
         if (func == "dtk_create_label") {
             auto *label = new DLabel(str, this);
@@ -258,7 +258,49 @@ private:
             qDebug() << "[DTK Host] Append message:" << str;
             return 0;
         }
-
+        if (func == "dtk_get_input_text") {
+            // 返回输入文本长度，outResultStr 携带文本内容
+            if (m_inputField) {
+                outResultStr = m_inputField->text();
+                qDebug() << "[DTK Host] get_input_text:" << outResultStr;
+                return (int32_t)outResultStr.toUtf8().size();
+            }
+            return 0;
+        }
+        if (func == "dtk_clear_input") {
+            if (m_inputField) m_inputField->clear();
+            qDebug() << "[DTK Host] clear_input";
+            return 0;
+        }
+        if (func == "dtk_set_label_text") {
+            auto it = m_widgets.find(a1);
+            if (it != m_widgets.end()) {
+                auto *label = qobject_cast<DLabel*>(it.value());
+                if (label) label->setText(str);
+            }
+            qDebug() << "[DTK Host] set_label_text id:" << a1 << "text:" << str;
+            return 0;
+        }
+        if (func == "dtk_set_widget_enabled") {
+            auto it = m_widgets.find(a1);
+            if (it != m_widgets.end()) {
+                it.value()->setEnabled(a2 != 0);
+            }
+            qDebug() << "[DTK Host] set_widget_enabled id:" << a1 << "enabled:" << a2;
+            return 0;
+        }
+        if (func == "dtk_send_to_server") {
+            if (m_socket && m_connected) {
+                QJsonObject msgObj;
+                msgObj["text"] = str;
+                QByteArray msgData = QJsonDocument(msgObj).toJson(QJsonDocument::Compact);
+                msgData.append('\n');
+                m_socket->write(msgData);
+                m_socket->flush();
+                qDebug() << "[DTK Host] send_to_server:" << str;
+            }
+            return 0;
+        }
         qWarning() << "[DTK Host] Unknown import:" << func;
         return 0;
     }
@@ -435,34 +477,22 @@ private slots:
     void onConnected()
     {
         m_connected = true;
-        if (m_statusLabel) {
-            m_statusLabel->setText("Connected to server (127.0.0.1:12345)");
-            DPalette pal = m_statusLabel->palette();
-            pal.setColor(DPalette::TextTips, QColor(0, 128, 0));
-            m_statusLabel->setPalette(pal);
+        // 委托给 WASM 插件处理全部连接逻辑
+        if (m_wasm && m_wasm->isAlive()) {
+            m_wasm->callExport("on_connected");
         }
-        if (m_sendButton) m_sendButton->setEnabled(true);
-        if (m_inputField) {
-            m_inputField->setEnabled(true);
-            m_inputField->setFocus();
-        }
-        appendMessage("[System] Connected to chat server!");
+        if (m_inputField) m_inputField->setFocus();
     }
 
     void onDisconnected()
     {
         m_connected = false;
-        if (m_statusLabel) {
-            m_statusLabel->setText("Disconnected from server");
-            DPalette pal = m_statusLabel->palette();
-            pal.setColor(DPalette::TextTips, QColor(255, 0, 0));
-            m_statusLabel->setPalette(pal);
+        // 委托给 WASM 插件处理全部断开逻辑
+        if (m_wasm && m_wasm->isAlive()) {
+            m_wasm->callExport("on_disconnected");
         }
-        if (m_sendButton) m_sendButton->setEnabled(false);
-        appendMessage("[System] Disconnected. Reconnecting in 3s...");
         QTimer::singleShot(3000, this, [this]() {
             if (!m_connected) {
-                appendMessage("[System] Reconnecting...");
                 m_socket->connectToHost("127.0.0.1", 12345);
             }
         });
@@ -484,42 +514,34 @@ private slots:
         QString dataStr = QString::fromUtf8(data).trimmed();
         if (dataStr.isEmpty()) return;
 
+        // 解析 JSON，提取回复文本
+        QString replyText;
         QJsonParseError parseError;
         QJsonDocument doc = QJsonDocument::fromJson(dataStr.toUtf8(), &parseError);
-        if (parseError.error != QJsonParseError::NoError) {
-            appendMessage("[Server] " + dataStr);
-            return;
+        if (parseError.error == QJsonParseError::NoError) {
+            replyText = doc.object().value("text").toString();
+        } else {
+            replyText = dataStr;
         }
-        QJsonObject obj = doc.object();
-        appendMessage("[Server] " + obj.value("text").toString());
+        if (replyText.isEmpty()) return;
+
+        // 委托给 WASM 插件处理消息显示逻辑
+        if (m_wasm && m_wasm->isAlive()) {
+            QByteArray utf8 = replyText.toUtf8();
+            uint32_t ptr = m_wasm->alloc(utf8.size());
+            m_wasm->writeString(ptr, replyText);
+            m_wasm->callExport_ii("on_server_message", (int32_t)ptr, (int32_t)utf8.size());
+        } else {
+            appendMessage("[Server] " + replyText);
+        }
     }
 
     void onSendClicked()
     {
-        if (!m_inputField || !m_connected) return;
-        QString text = m_inputField->text().trimmed();
-        if (text.isEmpty()) return;
-
-        // 通过进程插件分配 WASM 内存，写入消息，读回验证
+        // 委托给 WASM 插件处理全部发送逻辑（读取输入、格式化、显示、发送、清空）
         if (m_wasm && m_wasm->isAlive()) {
-            uint32_t ptr = m_wasm->alloc(text.toUtf8().size());
-            m_wasm->writeString(ptr, text);
-            QString wasmText = m_wasm->readString(ptr, text.toUtf8().size());
-            appendMessage("[Me] " + wasmText);
-        } else {
-            appendMessage("[Me] " + text);
+            m_wasm->callExport("on_send_clicked");
         }
-
-        // 发送到服务器
-        QJsonObject msgObj;
-        msgObj["text"] = text;
-        QByteArray msgData = QJsonDocument(msgObj).toJson(QJsonDocument::Compact);
-        msgData.append('\n');
-        m_socket->write(msgData);
-        m_socket->flush();
-
-        m_inputField->clear();
-        m_inputField->setFocus();
     }
 
 private:

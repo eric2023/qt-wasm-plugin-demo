@@ -34,7 +34,7 @@
 class WasmProcessBridge
 {
 public:
-    using DtkHostCallback = std::function<int32_t(const QString &func, int32_t arg1, int32_t arg2, const QString &str)>;
+    using DtkHostCallback = std::function<int32_t(const QString &func, int32_t arg1, int32_t arg2, int32_t arg3, const QString &str, QString &outResultStr)>;
 
     static inline DtkHostCallback s_hostCallback = nullptr;
 
@@ -210,16 +210,21 @@ private:
                 QJsonArray args = msg.value("args").toArray();
                 int32_t a1 = args.size() > 0 ? args[0].toInt() : 0;
                 int32_t a2 = args.size() > 1 ? args[1].toInt() : 0;
+                int32_t a3 = args.size() > 2 ? args[2].toInt() : 0;
                 QString str = msg.value("str").toString();
 
+                QString outResultStr;
                 int32_t result = 0;
                 if (s_hostCallback) {
-                    result = s_hostCallback(func, a1, a2, str);
+                    result = s_hostCallback(func, a1, a2, a3, str, outResultStr);
                 }
 
                 QJsonObject importResult;
                 importResult["type"] = "import_result";
                 importResult["value"] = (int)result;
+                if (!outResultStr.isEmpty()) {
+                    importResult["str"] = outResultStr;
+                }
                 QByteArray resultLine = QJsonDocument(importResult).toJson(QJsonDocument::Compact);
                 resultLine.append('\n');
                 m_process->write(resultLine);

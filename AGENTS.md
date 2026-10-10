@@ -9,7 +9,7 @@
 
 ```
 plugins/                WASM 插件 C++ 源码 → Emscripten 编译 → .wasm
-  chat_ui_plugin.cpp      前端 UI 插件（11 个 DTK import，4 个导出）
+  chat_ui_plugin.cpp      前端 UI 插件（16 个 DTK import，7 个导出 — 全部交互/数据逻辑在 WASM 内）
   random_reply_plugin.cpp 后端回复插件（零 import，2 个导出）
 scripts/                WASM 运行时与编译脚本
   compile_plugins.sh      Emscripten 编译脚本
@@ -17,7 +17,7 @@ scripts/                WASM 运行时与编译脚本
   wasm_runner.js          后端 WASM 一次性执行桥接
 src/                    C++ 源代码
   dtk_client_main.cpp     DTK 客户端入口
-  DtkChatClient.h         DTK 客户端核心（DTK 宿主 + 聊天逻辑）
+  DtkChatClient.h         DTK 客户端核心（纯展示宿主 — 仅嵌入 UI，不承担逻辑）
   WasmProcessBridge.h     QProcess WASM 桥接（IPC 通信）
   server_main.cpp         服务器入口
   ChatServer.h            Qt6 TCP 服务器
@@ -54,9 +54,10 @@ DISPLAY=:0 QT_QPA_PLATFORM=xcb ./build/dtkchatclient
 
 ## 关键约束
 
+- **WASM 插件拥有全部交互与数据逻辑**——客户端仅嵌入界面展示，不承担任何逻辑。发送消息、接收消息、连接/断开状态更新均由 WASM 导出函数驱动。参见 [WASM 全逻辑决策](.agents/notes/implemented/architecture/2026-10-10-wasm-owns-all-logic.md)。
 - **插件源码是 C++ 代码**，用 Emscripten 编译为 WASM。不使用手写 WAT/汇编。
 - **WASM 插件以进程插件形式运行**——独立 Node.js 子进程，崩溃不影响主程序。参见 [进程隔离决策](.agents/notes/implemented/architecture/2026-10-10-process-plugin-crash-isolation.md)。
-- **前端 WASM 插件依赖 DTK**——11 个 `extern "C"` 函数编译为 WASM import，无 DTK 宿主则无法实例化。参见 [DTK 依赖强制决策](.agents/notes/implemented/architecture/2026-10-10-dtk-dependency-enforcement.md)。
+- **前端 WASM 插件依赖 DTK**——16 个 `extern "C"` 函数编译为 WASM import，无 DTK 宿主则无法实例化。参见 [DTK 依赖强制决策](.agents/notes/implemented/architecture/2026-10-10-dtk-dependency-enforcement.md)。
 - **无 libc 依赖**——`-nostdlib` 编译，手写 `my_strlen`/`my_memcpy` 用 `__attribute__((optnone))` 防止编译器优化为 libc 调用。参见 [无 libc 依赖决策](.agents/notes/implemented/simplification/2026-10-10-no-libc-dependency.md)。
 - **同步 import 桥接**——Worker 线程 + SharedArrayBuffer + Atomics.wait/notify。参见 [同步桥接决策](.agents/notes/implemented/architecture/2026-10-10-shared-array-buffer-sync-bridge.md)。
 - **UI 控件均为 DTK 控件**——DMainWindow、DLabel、DTextEdit、DLineEdit、DSuggestButton、DMenu。

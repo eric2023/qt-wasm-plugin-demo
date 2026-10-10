@@ -24,21 +24,26 @@ const path = require('path');
 const { Worker, isMainThread, workerData, parentPort } = require('worker_threads');
 
 // SharedArrayBuffer 布局
-const SAB_SIZE = 4120;
+const SAB_SIZE = 8244;
 const TAG_OFFSET = 0;          // int32: 0=idle, 1=import request
 const FUNCLEN_OFFSET = 4;
 const FUNC_OFFSET = 8;         // max 32 bytes
 const ARG1_OFFSET = 40;
 const ARG2_OFFSET = 44;
-const STRLEN_OFFSET = 48;
-const STR_OFFSET = 52;         // max 4096 bytes
+const ARG3_OFFSET = 48;        // int32: 3rd arg (for 3-arg imports)
+const STRLEN_OFFSET = 52;
+const STR_OFFSET = 56;         // max 4096 bytes
 const STR_MAX = 4096;
-const RESULT_OFFSET = 4116;
+const RESULT_OFFSET = 4152;    // int32: return value
+const RESULT_STRLEN_OFFSET = 4156; // int32: result string length
+const RESULT_STR_OFFSET = 4160;    // max 4096 bytes
+const RESULT_STR_MAX = 4096;
 
 // 带字符串参数的导入函数集合
 const STR_FUNCS = new Set([
     'dtk_create_label', 'dtk_create_lineedit', 'dtk_create_pushbutton',
-    'dtk_set_window_title', 'dtk_append_message'
+    'dtk_set_window_title', 'dtk_append_message',
+    'dtk_set_label_text', 'dtk_send_to_server'
 ]);
 
 // ═══════════════════════════════════════════════════════════════
@@ -69,16 +74,30 @@ if (!isMainThread) {
 
                 const a1 = args.length > 0 ? args[0] : 0;
                 const a2 = args.length > 1 ? args[1] : 0;
+                const a3 = args.length > 2 ? args[2] : 0;
                 i32[ARG1_OFFSET / 4] = a1;
                 i32[ARG2_OFFSET / 4] = a2;
+                i32[ARG3_OFFSET / 4] = a3;
 
                 // 预读字符串参数
-                if (STR_FUNCS.has(funcName) && args.length >= 2 && memory) {
-                    const str = readMemStr(a1, a2, memory);
-                    const strBytes = Buffer.from(str, 'utf8');
-                    const strLen = Math.min(strBytes.length, STR_MAX);
-                    i32[STRLEN_OFFSET / 4] = strLen;
-                    u8.set(strBytes.subarray(0, strLen), STR_OFFSET);
+                // dtk_set_label_text(labelId, ptr, len): 字符串在 a2/a3
+                // 其他 STR_FUNCS: 字符串在 a1/a2
+                if (STR_FUNCS.has(funcName) && memory) {
+                    let strPtr, strLen;
+                    if (funcName === 'dtk_set_label_text') {
+                        strPtr = a2; strLen = a3;
+                    } else {
+                        strPtr = a1; strLen = a2;
+                    }
+                    if (strLen > 0) {
+                        const str = readMemStr(strPtr, strLen, memory);
+                        const strBytes = Buffer.from(str, 'utf8');
+                        const slen = Math.min(strBytes.length, STR_MAX);
+                        i32[STRLEN_OFFSET / 4] = slen;
+                        u8.set(strBytes.subarray(0, slen), STR_OFFSET);
+                    } else {
+                        i32[STRLEN_OFFSET / 4] = 0;
+                    }
                 } else {
                     i32[STRLEN_OFFSET / 4] = 0;
                 }
@@ -87,7 +106,20 @@ if (!isMainThread) {
                 Atomics.notify(i32, TAG_OFFSET / 4, 1);
 
                 Atomics.wait(i32, TAG_OFFSET / 4, 1);
-                return Atomics.load(i32, RESULT_OFFSET / 4);
+                const result = Atomics.load(i32, RESULT_OFFSET / 4);
+
+                // dtk_get_input_text: 宿主将输入文本写入 SAB result-string 区域，
+                // Worker 将其复制到 WASM 内存 ptr 位置
+                if (funcName === 'dtk_get_input_text' && memory && result > 0) {
+                    const rsLen = Atomics.load(i32, RESULT_STRLEN_OFFSET / 4);
+                    if (rsLen > 0 && rsLen <= RESULT_STR_MAX) {
+                        const rsBytes = u8.subarray(RESULT_STR_OFFSET, RESULT_STR_OFFSET + rsLen);
+                        const wasmMem = new Uint8Array(memory.buffer, a1, rsLen);
+                        wasmMem.set(rsBytes);
+                    }
+                }
+
+                return result;
             };
         }
 
@@ -104,7 +136,10 @@ if (!isMainThread) {
             'dtk_create_label', 'dtk_create_textedit', 'dtk_create_lineedit',
             'dtk_create_pushbutton', 'dtk_create_hbox', 'dtk_add_to_layout',
             'dtk_set_window_title', 'dtk_set_window_size',
-            'dtk_get_theme', 'dtk_set_theme', 'dtk_append_message'
+            'dtk_get_theme', 'dtk_set_theme', 'dtk_append_message',
+            'dtk_get_input_text', 'dtk_clear_input',
+            'dtk_set_label_text', 'dtk_set_widget_enabled',
+            'dtk_send_to_server'
         ];
         for (const name of dtkImportNames) {
             dtkFuncs[name] = makeDtkImport(name, memoryGetter);
@@ -222,10 +257,11 @@ if (!isMainThread) {
             const funcName = Buffer.from(u8.subarray(FUNC_OFFSET, FUNC_OFFSET + funcLen)).toString('utf8');
             const a1 = i32[ARG1_OFFSET / 4];
             const a2 = i32[ARG2_OFFSET / 4];
+            const a3 = i32[ARG3_OFFSET / 4];
             const strLen = i32[STRLEN_OFFSET / 4];
             const str = strLen > 0 ? Buffer.from(u8.subarray(STR_OFFSET, STR_OFFSET + strLen)).toString('utf8') : '';
 
-            sendToParent({ type: 'import', func: funcName, args: [a1, a2], str: str });
+            sendToParent({ type: 'import', func: funcName, args: [a1, a2, a3], str: str });
             waitingImportResult = true;
             return;
         }
@@ -250,6 +286,15 @@ if (!isMainThread) {
             if (waitingImportResult) {
                 const value = req.value || 0;
                 Atomics.store(i32, RESULT_OFFSET / 4, value);
+                // 如果 C++ 附带了结果字符串，写入 SAB result-string 区域
+                if (req.str) {
+                    const strBytes = Buffer.from(req.str, 'utf8');
+                    const strLen = Math.min(strBytes.length, RESULT_STR_MAX);
+                    Atomics.store(i32, RESULT_STRLEN_OFFSET / 4, strLen);
+                    u8.set(strBytes.subarray(0, strLen), RESULT_STR_OFFSET);
+                } else {
+                    Atomics.store(i32, RESULT_STRLEN_OFFSET / 4, 0);
+                }
                 Atomics.store(i32, TAG_OFFSET / 4, 0);
                 Atomics.notify(i32, TAG_OFFSET / 4, 1);
                 waitingImportResult = false;
