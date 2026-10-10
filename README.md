@@ -8,12 +8,16 @@ WASM 插件以**进程插件**形式运行——在独立的 Node.js 子进程�
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                       DTK 客户端进程                          │
+│                       DTK 客户端进程（纯展示宿主）              │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │  WASM UI 插件 (chat_ui_plugin.wasm)                  │    │
 │  │  C++ 源码 → Emscripten 编译 → WASM                    │    │
-│  │  导入 11 个 DTK 宿主函数 (env 模块)                    │    │
+│  │  ─ 全部交互与数据逻辑在 WASM 内闭环 ─                  │    │
+│  │  导入 16 个 DTK 宿主函数 (env 模块)                    │    │
+│  │  导出 7 个函数 (build_ui/on_send_clicked/             │    │
+│  │    on_server_message/on_connected/                    │    │
+│  │    on_disconnected/toggle_theme/alloc)                │    │
 │  │  没有 DTK 宿主，插件无法实例化！                        │    │
 │  └────────────────────┬────────────────────────────────┘    │
 │                       │ JSON IPC (stdin/stdout 行分隔)        │
@@ -21,8 +25,11 @@ WASM 插件以**进程插件**形式运行——在独立的 Node.js 子进程�
 │  │  WasmProcessBridge (QProcess)                        │    │
 │  │    → 启动 node wasm_dtk_host.js 子进程                 │    │
 │  │    ← 接收 import 请求 → 调用 DTK 宿主回调              │    │
-│  │    → 返回 import_result                              │    │
-│  │  DTK 宿主创建: DLabel, DTextEdit,                     │    │
+│  │    → 返回 import_result (+ result_str)               │    │
+│  │  DtkChatClient (纯转发层):                            │    │
+│  │    事件 → callExport("on_xxx")                        │    │
+│  │    不承担任何交互/数据逻辑                              │    │
+│  │  DTK 宿主提供: DLabel, DTextEdit,                     │    │
 │  │  DLineEdit, DSuggestButton, DMenu                     │    │
 │  └─────────────────────────────────────────────────────┘    │
 │                       ↓ TCP (127.0.0.1:12345)                 │
@@ -58,28 +65,33 @@ Node.js 主线程是异步的，WASM 在 Worker 线程中同步执行。
 DTK 客户端进程                     Node.js 子进程 (wasm_dtk_host.js)
 ┌──────────────────┐             ┌──────────────────────────────────┐
 │ DtkChatClient    │  stdin →    │ 主线程                            │
-│  WasmProcessBridge│ ←stdout    │  readline 异步处理 stdin/stdout   │
+│  (纯转发层)       │ ←stdout    │  readline 异步处理 stdin/stdout   │
 │                  │             │  pollImport() 轮询 SharedArrayBuffer│
 │  handleDtkHostCall│ ←import    │  ↕ postMessage                   │
 │  → new DLabel(str)│ result→    │ Worker 线程                       │
 │  → 返回 widget_id │            │  WebAssembly.instantiate         │
-│                  │             │  chat_ui_plugin.wasm             │
-│                  │             │  import 函数:                     │
+│  → 返回 input_str │            │  chat_ui_plugin.wasm             │
+│  (无交互逻辑)      │            │  ─ 全部逻辑在 WASM 内 ─            │
+│                  │             │  import 函数 (16 个):              │
 │                  │             │    预读 WASM 内存字符串            │
 │                  │             │    → 写入 SharedArrayBuffer       │
 │                  │             │    → Atomics.notify(主线程)        │
 │                  │             │    → Atomics.wait(阻塞等结果)      │
-│                  │             │    ← 主线程写入 result            │
+│                  │             │    ← 主线程写入 result + result_str│
 │                  │             │    → Atomics.notify(唤醒)          │
 └──────────────────┘             └──────────────────────────────────┘
 ```
 
 **预读字符串避免死锁**：带字符串参数的 import 函数（`dtk_create_label`、
 `dtk_create_lineedit`、`dtk_create_pushbutton`、`dtk_set_window_title`、
-`dtk_append_message`）在 Worker 端预读 WASM 线性内存中的字符串，
-附带在 import 请求中通过 SharedArrayBuffer 传给 C++ 宿主。
+`dtk_append_message`、`dtk_set_label_text`、`dtk_send_to_server`）在 Worker 端
+预读 WASM 线性内存中的字符串，附带在 import 请求中通过 SharedArrayBuffer 传给 C++ 宿主。
 这样 C++ 不需要回读 WASM 内存（那会导致死锁：C++ 阻塞等 stdout，
 Node 阻塞等 import_result）。
+
+**结果字符串返回**：`dtk_get_input_text` 需要将输入框文本从 C++ 传回 WASM 内存。
+C++ 通过 `import_result` 的 `str` 字段返回文本，主线程写入 SAB 的 `RESULT_STR` 区域，
+Worker 收到后将其复制到 WASM 内存中 `ptr` 指向的位置。
 
 ### 服务器端 WASM 桥接（后端）
 
@@ -110,13 +122,13 @@ WASM 插件源码是标准 C++ 文件（`chat_ui_plugin.cpp`、`random_reply_plu
 
 ### 2. WASM 插件依赖 DTK
 
-前端 WASM 插件通过 `extern "C"` 声明 11 个 DTK 宿主函数：
+前端 WASM 插件通过 `extern "C"` 声明 16 个 DTK 宿主函数：
 
 ```cpp
 extern "C" {
     int32_t dtk_create_label(const char* text, int32_t len);
     int32_t dtk_create_textedit(int32_t readonly, int32_t unused);
-    // ... 共 11 个
+    // ... 共 16 个
 }
 ```
 
@@ -124,7 +136,7 @@ Emscripten 编译时，这些未定义符号通过 `-Wl,--import-undefined` 自�
 WASM import（位于 `env` 模块下）。没有 DTK 宿主提供这些 import，
 WASM 模块**无法实例化**——这就是 DTK 依赖的强制机制。
 
-验证：`chat_ui_plugin.wasm` 有 11 个 import，全部是 `env.dtk_*` 函数。
+验证：`chat_ui_plugin.wasm` 有 16 个 import，全部是 `env.dtk_*` 函数。
 
 ### 3. 进程插件（进程隔离）
 
@@ -138,7 +150,7 @@ WASM 运行时**不在 DTK 进程内**——作为独立 Node.js 子进程运行
 防止编译器将循环优化为 `strlen`/`memcpy` 的 libc 调用。
 编译时用 `-nostdlib`，生成的 WASM 模块无 libc import。
 
-验证：`random_reply_plugin.wasm` 零 import；`chat_ui_plugin.wasm` 仅 11 个 DTK import。
+验证：`random_reply_plugin.wasm` 零 import；`chat_ui_plugin.wasm` 仅 16 个 DTK import。
 
 ### 5. DTK 控件
 
@@ -186,8 +198,8 @@ wasm/
 │
 ├── src/                            # C++ 源代码
 │   ├── dtk_client_main.cpp         # DTK 客户端入口
-│   ├── DtkChatClient.h             # DTK 客户端核心（仅头文件，554 行）
-│   ├── WasmProcessBridge.h         # QProcess WASM 桥接（仅头文件，278 行）
+│   ├── DtkChatClient.h             # DTK 客户端核心（仅头文件，584 行）
+│   ├── WasmProcessBridge.h         # QProcess WASM 桥接（仅头文件，282 行）
 │   ├── server_main.cpp             # 服务器入口
 │   ├── ChatServer.h                # Qt6 TCP 服务器（仅头文件，153 行）
 │   ├── ChatServer.cpp              # ChatServer 桩文件
@@ -204,8 +216,8 @@ wasm/
 
 #### `chat_ui_plugin.cpp` — 前端 UI 插件 C++ 源码
 
-用 Emscripten 编译为 `chat_ui_plugin.wasm`。通过 `extern "C"` 声明 11 个 DTK 宿主函数
-（编译为 WASM import），导出 4 个函数供宿主通过 IPC 调用。
+用 Emscripten 编译为 `chat_ui_plugin.wasm`。通过 `extern "C"` 声明 16 个 DTK 宿主函数
+（编译为 WASM import），导出 7 个函数供宿主通过 IPC 调用。
 
 **静态字符串数据**（编译时放入 WASM linear memory 的 data segment）：
 
@@ -222,12 +234,15 @@ wasm/
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
-| `build_ui()` | `() → i32` | 调用 DTK 宿主函数创建全部 UI 控件（窗口标题/尺寸、2 个标签、文本编辑器、水平布局、输入框、按钮），返回主布局 ID |
-| `format_message(ptr, len)` | `(i32, i32) → i32` | 在 WASM 内存中拼接 `"[Me] " + 消息`，调用 `dtk_append_message` 显示 |
+| `build_ui()` | `() → i32` | 调用 DTK 宿主函数创建全部 UI 控件（窗口标题/尺寸、2 个标签、文本编辑器、水平布局、输入框、按钮），保存控件 ID，初始禁用输入，返回主布局 ID |
+| `on_send_clicked()` | `() → i32` | 读取输入框文本 → 格式化 `"[Me] "` 前缀 → 显示 → 发送到服务器 → 清空输入（全部逻辑在 WASM 内） |
+| `on_server_message(ptr, len)` | `(i32, i32) → i32` | 格式化 `"[Server] "` 前缀 → 显示服务器回复消息 |
+| `on_connected()` | `() → i32` | 更新状态标签 → 启用输入框和按钮 → 显示连接消息 |
+| `on_disconnected()` | `() → i32` | 更新状态标签 → 禁用按钮 → 显示断开消息 |
 | `toggle_theme()` | `() → i32` | 调用 `dtk_get_theme` 获取当前主题，调用 `dtk_set_theme` 切换，返回旧主题值 |
 | `alloc(size)` | `(i32) → i32` | WASM 线性内存 bump 分配器，宿主通过 IPC 调用来分配内存 |
 
-**`build_ui()` 执行序列**（14 次 DTK 宿主调用）：
+**`build_ui()` 执行序列**（17 次 DTK 宿主调用）：
 
 ```
 1. dtk_set_window_title("WASM-Powered Chat (DTK)")
@@ -245,6 +260,8 @@ wasm/
 13. dtk_add_to_layout(4, 5)           → 输入框加入输入行
 14. dtk_create_pushbutton("Send")     → sendButton = 6
 15. dtk_add_to_layout(4, 6)           → 发送按钮加入输入行
+16. dtk_set_widget_enabled(inputField, 0)  → 初始禁用输入框
+17. dtk_set_widget_enabled(sendButton, 0)  → 初始禁用发送按钮
 返回 mainLayout (0)
 ```
 
@@ -285,7 +302,7 @@ wasm/
 | `-O2` | 优化级别 |
 | `-s WASM=1` | 生成独立 .wasm 文件 |
 | `-s ALLOW_MEMORY_GROWTH=1` | 允许线性内存动态增长 |
-| `-s EXPORTED_FUNCTIONS='["_build_ui","_format_message","_toggle_theme","_alloc"]'` | 导出函数 |
+| `-s EXPORTED_FUNCTIONS='["_build_ui","_on_send_clicked","_on_server_message","_on_connected","_on_disconnected","_toggle_theme","_alloc"]'` | 导出函数 |
 | `-s ERROR_ON_UNDEFINED_SYMBOLS=0` | 允许未定义符号（DTK 宿主导入） |
 | `-nostdlib` | 不链接标准库（避免 libc import） |
 | `-Wl,--no-entry` | 无入口点（纯库模块） |
@@ -297,7 +314,7 @@ wasm/
 
 长驻 Node.js 子进程，主线程 + Worker 线程架构。
 
-**SharedArrayBuffer 布局**（4120 字节）：
+**SharedArrayBuffer 布局**（8244 字节）：
 
 | 偏移 | 大小 | 用途 |
 |------|------|------|
@@ -306,12 +323,14 @@ wasm/
 | 8 | 32 | 函数名（UTF-8） |
 | 40 | 4 | 参数 1 (arg1) |
 | 44 | 4 | 参数 2 (arg2) |
-| 48 | 4 | 字符串长度 |
-| 52 | 4096 | 字符串数据（UTF-8） |
-| 4116 | 4 | 结果值 (result) |
+| 48 | 4 | 参数 3 (arg3) |
+| 52 | 4 | 字符串长度 |
+| 56 | 4096 | 字符串数据（UTF-8） |
+| 4152 | 4 | 结果值 (result) |
+| 4156 | 4 | 结果字符串长度 (result_strlen) |
+| 4160 | 4096 | 结果字符串数据（UTF-8） |
 
-**Worker 线程**：
-1. 读取 WASM 二进制，构建 11 个 DTK import 函数（`makeDtkImport`）
+1. 读取 WASM 二进制，构建 16 个 DTK import 函数（`makeDtkImport`）
 2. `WebAssembly.instantiate` 实例化（import 对象提供在 `env` 模块下）
 3. 收到 `call` 消息时同步执行 WASM 导出函数
 4. WASM import 函数执行时：预读字符串 → 写入 SAB → `Atomics.notify` → `Atomics.wait` 阻塞
@@ -334,9 +353,9 @@ wasm/
 
 创建 `DApplication`，配置 DDE 平台集成，实例化 `DtkChatClient`，显示窗口，进入事件循环。
 
-#### `DtkChatClient.h` — DTK 客户端核心（仅头文件，554 行）
+#### `DtkChatClient.h` — DTK 客户端核心（仅头文件，584 行）
 
-继承 `DMainWindow`，是 DTK 宿主和聊天逻辑的核心。
+继承 `DMainWindow`，是 DTK 宿主和事件转发的核心。**纯展示宿主——不承担任何交互/数据逻辑**。
 
 **构造函数流程**：
 1. 创建 centralWidget + `QVBoxLayout`（主布局容器）
@@ -347,7 +366,7 @@ wasm/
 6. 连接 Send 按钮和输入框的信号
 7. 创建 `QTcpSocket`，500ms 后自动连接服务器
 
-**`handleDtkHostCall(func, a1, a2, str)`** — 处理 11 个 DTK 导入命令：
+**`handleDtkHostCall(func, a1, a2, a3, str, outResultStr)`** — 处理 16 个 DTK 导入命令：
 
 | 命令 | C++ 动作 | 返回值 |
 |------|---------|--------|
@@ -362,6 +381,11 @@ wasm/
 | `dtk_get_theme` | 返回当前主题（0=浅色, 1=深色） | 主题值 |
 | `dtk_set_theme` | 设置 `DGuiApplicationHelper` 调色板类型，调用 `applyThemeColors` | 0 |
 | `dtk_append_message` | `appendMessage(str)` 添加带时间戳的消息 | 0 |
+| `dtk_get_input_text` | 读取 `m_inputField` 文本，写入 `outResultStr` | 文本长度 |
+| `dtk_clear_input` | `m_inputField->clear()` | 0 |
+| `dtk_set_label_text` | 查找 `m_widgets[a1]`，`setText(str)` | 0 |
+| `dtk_set_widget_enabled` | 查找 `m_widgets[a1]`，`setEnabled(a2)` | 0 |
+| `dtk_send_to_server` | TCP 发送 `{"text":str}` 到服务器 | 0 |
 
 控件/布局通过 `QMap<int32_t, QWidget*> m_widgets` 和
 `QMap<int32_t, QHBoxLayout*> m_layouts` 注册管理，
@@ -373,25 +397,26 @@ WASM 返回的 ID 是后续 `add_to_layout` 的引用句柄。
 - **Save As...** — `DFileDialog` 保存聊天记录到文本文件
 - **Theme Toggle** — 调用 WASM `toggle_theme` 导出函数切换主题
 
-**消息发送**（`onSendClicked`）：
-1. 通过 `m_wasm->alloc()` 在 WASM 内存分配空间
-2. `m_wasm->writeString()` 写入消息文本
-3. `m_wasm->readString()` 读回验证
-4. `appendMessage("[Me] " + wasmText)` 本地显示
-5. 通过 TCP 发送 JSON `{"text":"..."}` 到服务器
+**消息发送**（`onSendClicked`）— 纯转发，无逻辑：
+1. `callExport("on_send_clicked")` → WASM 处理全部逻辑（读输入 → 格式化 → 显示 → 发送 → 清空）
 
-**消息接收**（`onReadyRead`）：
-- 读取 TCP 数据，解析 JSON，`appendMessage("[Server] " + text)`
+**消息接收**（`onReadyRead`）— 纯转发，无逻辑：
+1. 读取 TCP 数据，解析 JSON
+2. `alloc(len)` + `writeString(ptr, reply)` 写入 WASM 内存
+3. `callExport_ii("on_server_message", ptr, len)` → WASM 格式化并显示
+
+**连接状态**（`onConnected`/`onDisconnected`）— 纯转发：
+- `onConnected()` → `callExport("on_connected")` → WASM 更新状态、启用控件、显示消息
+- `onDisconnected()` → `callExport("on_disconnected")` → WASM 更新状态、禁用控件、显示消息 + 3s 重连
 
 **TCP 通信**：
 - 自动连接 `127.0.0.1:12345`
 - 断线后 3 秒自动重连
-- 连接/断线/错误状态更新到状态标签
 
 **后备 UI**（`buildFallbackUi`）：
 WASM 加载失败时用 C++ 直接创建相同的 UI 控件，保证应用可用。
 
-#### `WasmProcessBridge.h` — QProcess WASM 桥接（仅头文件，278 行）
+#### `WasmProcessBridge.h` — QProcess WASM 桥接（仅头文件，282 行）
 
 管理 `wasm_dtk_host.js` 子进程的生命周期和 IPC 通信。
 
@@ -419,8 +444,8 @@ WASM 加载失败时用 C++ 直接创建相同的 UI 控件，保证应用可用
 
 `readLineSync(timeoutMs)` 使用 `waitForReadyRead` + `readAll` 同步读取一行 JSON。
 
-回调类型：`std::function<int32_t(const QString &func, int32_t arg1, int32_t arg2, const QString &str)>`，
-`str` 由 JS 端预读 WASM 内存后通过 IPC 传递。
+回调类型：`std::function<int32_t(const QString &func, int32_t arg1, int32_t arg2, int32_t arg3, const QString &str, QString &outResultStr)>`，
+`str` 由 JS 端预读 WASM 内存后通过 IPC 传递，`outResultStr` 用于返回结果字符串（如 `dtk_get_input_text`）。
 
 ### 服务器源码（`src/`）
 
@@ -563,8 +588,8 @@ check("plugins/chat_ui_plugin.wasm").then(() => check("plugins/random_reply_plug
 
 ```
 plugins/chat_ui_plugin.wasm
-  imports: env.dtk_set_window_title, env.dtk_set_window_size, env.dtk_create_hbox, env.dtk_create_label, env.dtk_add_to_layout, env.dtk_create_textedit, env.dtk_create_lineedit, env.dtk_create_pushbutton, env.dtk_append_message, env.dtk_get_theme, env.dtk_set_theme
-  exports: memory, __indirect_function_table, alloc, build_ui, format_message, toggle_theme
+  imports: env.dtk_set_window_title, env.dtk_set_window_size, env.dtk_create_hbox, env.dtk_create_label, env.dtk_add_to_layout, env.dtk_create_textedit, env.dtk_create_lineedit, env.dtk_create_pushbutton, env.dtk_append_message, env.dtk_get_theme, env.dtk_set_theme, env.dtk_get_input_text, env.dtk_clear_input, env.dtk_set_label_text, env.dtk_set_widget_enabled, env.dtk_send_to_server
+  exports: memory, __indirect_function_table, alloc, build_ui, on_send_clicked, on_server_message, on_connected, on_disconnected, toggle_theme
 plugins/random_reply_plugin.wasm
   imports: none
   exports: memory, __indirect_function_table, generate_reply, get_reply_len
@@ -638,6 +663,8 @@ WASM UI plugin loaded — calling build_ui()...
 [DTK Host] add_to_layout layout: 4 widget: 5
 [DTK Host] Created push_button id: 6
 [DTK Host] add_to_layout layout: 4 widget: 6
+[DTK Host] set_widget_enabled widget: 5 enabled: 0
+[DTK Host] set_widget_enabled widget: 6 enabled: 0
 UI built by WASM plugin, layout ID: 0
 ```
 
@@ -722,7 +749,7 @@ kill %1 2>/dev/null  # 或 pkill -f wasmchatserver
 | 消息类型 | 示例 | 说明 |
 |---------|------|------|
 | `call` | `{"type":"call","func":"build_ui","args":[]}` | 调用 WASM 导出函数 |
-| `import_result` | `{"type":"import_result","value":1}` | 返回 DTK 宿主回调结果 |
+| `import_result` | `{"type":"import_result","value":5,"str":"Hello WASM Server!"}` | 返回 DTK 宿主回调结果（`str` 为结果字符串，如 `dtk_get_input_text` 返回的输入文本） |
 | `read_memory` | `{"type":"read_memory","offset":512,"len":30}` | 读取 WASM 线性内存 |
 | `write_memory` | `{"type":"write_memory","offset":ptr,"hex":"..."}` | 写入 WASM 线性内存 |
 | `quit` | `{"type":"quit"}` | 通知子进程退出 |
@@ -769,6 +796,11 @@ WASM UI 插件从 `env` 模块导入以下函数（C++ `extern "C"` 声明，Ems
 | `dtk_get_theme` | `() → theme` | 获取当前主题（0=浅色, 1=深色） |
 | `dtk_set_theme` | `(theme, _) → 0` | 设置主题 |
 | `dtk_append_message` | `(ptr, len) → 0` | 追加消息到显示区 |
+| `dtk_get_input_text` | `(ptr, maxlen) → len` | 读取输入框文本，宿主通过 result-str 返回 |
+| `dtk_clear_input` | `() → 0` | 清空输入框 |
+| `dtk_set_label_text` | `(labelId, ptr, len) → 0` | 设置标签文本（3 参数） |
+| `dtk_set_widget_enabled` | `(widgetId, enabled) → 0` | 启用/禁用控件 |
+| `dtk_send_to_server` | `(ptr, len) → 0` | 发送数据到服务器（TCP） |
 
 > `ptr`/`len` 参数指向 WASM 线性内存中的 UTF-8 字符串。
 > JS 端在发送 import 请求前预读这些字符串，通过 IPC 的 `str` 字段传递给 C++，
@@ -794,36 +826,76 @@ WASM UI 插件从 `env` 模块导入以下函数（C++ `extern "C"` 声明，Ems
          → 主线程: stderr 输出就绪信号
          → C++ 等待 stderr 就绪信号
      → callExport("build_ui")
-         → 14 次 import 往返（见上文 build_ui 执行序列）
+         → 16 次 import 往返（创建控件 + 初始禁用输入）
          → 每次往返: Worker → SAB → 主线程 → stdout → C++ → stdin → 主线程 → SAB → Worker
-         → C++ 在自己进程内 new DLabel/DTextEdit/... 并加入布局
+         → C++ 在自己进程内 new DLabel/DTextEdit/... 并加入布局（纯展示）
+         → WASM 保存全部控件 ID，调用 dtk_set_widget_enabled 禁用输入
          → 返回 call_result
      → applyThemeColors()
      → QTimer 500ms 后 TCP 连接服务器
+
+3. TCP 连接成功
+   C++ onConnected() → callExport("on_connected")
+     → WASM on_connected():
+         ├─ dtk_set_label_text(statusLabel, "Connected to server...")  → C++ 更新标签
+         ├─ dtk_set_widget_enabled(inputField, 1)                      → C++ 启用输入框
+         ├─ dtk_set_widget_enabled(sendButton, 1)                      → C++ 启用按钮
+         └─ dtk_append_message("[System] Connected to chat server!")   → C++ 显示消息
 ```
 
-### 消息发送流程
+### 消息发送流程（全部逻辑在 WASM 内闭环）
 
 ```
-用户输入文本 → 点击 Send
+用户输入文本 → 点击 Send / 按回车
   │
-  ├─ m_wasm->alloc(text.size())        ← IPC: call alloc → WASM bump allocator → 返回 ptr
-  ├─ m_wasm->writeString(ptr, text)    ← IPC: write_memory → 写入 WASM 线性内存
-  ├─ m_wasm->readString(ptr, size)     ← IPC: read_memory → 读回验证
-  ├─ appendMessage("[Me] " + wasmText) ← C++ 本地显示
-  └─ TCP 发送 {"text":"..."} 到服务器
+  └─ C++ onSendClicked() → callExport("on_send_clicked")  ← 仅转发，无逻辑
        │
-       └─ 服务器收到
-          ├─ 生成 seed = timestamp ⊕ counter × 2654435761 ⊕ msg_length
-          ├─ WasmPluginLoader::invoke("generate_reply", {seed})
-          │    → QProcess 启动 node wasm_runner.js
-          │    → Node 实例化 random_reply_plugin.wasm
-          │    → 调用 generate_reply(seed) → 返回回复指针
-          │    → 读取回复字符串 → {"success":true,"result":"..."}
-          └─ TCP 返回 {"text":"回复","echo":"原文","seed":种子}
-               │
-               └─ 客户端收到
-                  └─ appendMessage("[Server] " + text)
+       └─ WASM on_send_clicked():
+            ├─ dtk_get_input_text(ptr, 4096)
+            │    → C++ 读取输入框文本，通过 result_str 返回
+            │    → Worker 将文本写入 WASM 内存 ptr
+            │    → 返回文本长度
+            ├─ 格式化: "[Me] " + 消息  （在 WASM 内存中拼接）
+            ├─ dtk_append_message(msgPtr, totalLen)
+            │    → C++ 在消息显示区追加 "[Me] Hello..."
+            ├─ dtk_send_to_server(origPtr, inputLen)
+            │    → C++ 通过 TCP 发送 {"text":"Hello..."} 到服务器
+            └─ dtk_clear_input()
+                 → C++ 清空输入框
+
+       服务器收到
+         ├─ 生成 seed = timestamp ⊕ counter × 2654435761 ⊕ msg_length
+         ├─ WasmPluginLoader::invoke("generate_reply", {seed})
+         │    → QProcess 启动 node wasm_runner.js
+         │    → Node 实例化 random_reply_plugin.wasm
+         │    → 调用 generate_reply(seed) → 返回回复指针
+         │    → 读取回复字符串 → {"success":true,"result":"..."}
+         └─ TCP 返回 {"text":"回复","echo":"原文","seed":种子}
+              │
+              └─ C++ onReadyRead() 收到
+                 ├─ 解析 JSON，提取 "text" 回复
+                 ├─ m_wasm->alloc(len) + writeString(ptr, reply)  ← 写入 WASM 内存
+                 └─ callExport_ii("on_server_message", ptr, len)  ← 仅转发，无逻辑
+                      │
+                      └─ WASM on_server_message(ptr, len):
+                           ├─ 格式化: "[Server] " + 消息  （在 WASM 内存中拼接）
+                           └─ dtk_append_message(msgPtr, totalLen)
+                                → C++ 在消息显示区追加 "[Server] ..."
+```
+
+### 连接断开流程
+
+```
+TCP 连接断开
+  │
+  └─ C++ onDisconnected() → callExport("on_disconnected")  ← 仅转发，无逻辑
+       │
+       └─ WASM on_disconnected():
+            ├─ dtk_set_label_text(statusLabel, "Disconnected from server")  → C++ 更新标签
+            ├─ dtk_set_widget_enabled(sendButton, 0)                        → C++ 禁用按钮
+            └─ dtk_append_message("[System] Disconnected. Reconnecting...") → C++ 显示消息
+
+  C++ QTimer 3s 后自动重连 → onConnected → callExport("on_connected") → WASM 处理
 ```
 
 ### 主题切换流程
@@ -831,28 +903,25 @@ WASM UI 插件从 `env` 模块导入以下函数（C++ `extern "C"` 声明，Ems
 ```
 右键菜单 → "Switch to Dark/Light Theme"
   │
-  └─ toggleTheme()
-       ├─ m_wasm->callExport("toggle_theme")  ← IPC: call toggle_theme
-       │     │
-       │     └─ Worker 执行 WASM toggle_theme():
-       │          ├─ call dtk_get_theme          → import → C++ 返回当前主题
-       │          ├─ call dtk_set_theme(新值)    → import → C++ 切换主题
-       │          │    └─ C++ handleDtkHostCall:
-       │          │         ├─ DGuiApplicationHelper::setPaletteType()
-       │          │         └─ applyThemeColors()  ← 设置 DTextEdit 深色/浅色调色板+样式表
-       │          └─ 返回旧主题值
+  └─ toggleTheme() → callExport("toggle_theme")  ← 仅转发，无逻辑
        │
-       └─ appendMessage("[System] Theme switched to ...")
+       └─ WASM toggle_theme():
+            ├─ dtk_get_theme()          → C++ 返回当前主题
+            ├─ dtk_set_theme(新值)      → C++ 切换主题
+            │    └─ DGuiApplicationHelper::setPaletteType()
+            │       └─ applyThemeColors()  ← 设置 DTextEdit 深色/浅色调色板+样式表
+            └─ 返回旧主题值
 ```
 
 ## 功能特性
 
+- **WASM 拥有全部交互与数据逻辑**：客户端仅嵌入界面展示，不承担任何逻辑。发送、接收、连接/断开均由 WASM 导出函数闭环处理
 - **C++ 源码编译为 WASM**：插件源码是标准 C++，用 Emscripten 编译
 - **WASM 定义 UI**：整个 UI 布局由 WASM 插件通过调用 DTK 宿主函数创建控件
-- **WASM 消息处理**：消息通过 WASM 线性内存分配、写入、格式化
+- **WASM 消息处理**：消息格式化、显示、发送均在 WASM 线性内存中完成
 - **WASM 后端**：服务器使用 WASM 插件生成随机回复
 - **进程隔离**：WASM 在独立进程中运行，插件崩溃不影响主程序
-- **DTK 依赖强制**：WASM 模块导入 11 个 DTK 宿主函数，无 DTK 则无法实例化
+- **DTK 依赖强制**：WASM 模块导入 16 个 DTK 宿主函数，无 DTK 则无法实例化
 - **无 libc 依赖**：手写字符串/内存函数，`-nostdlib` 编译
 - **右键上下文菜单**：复制、粘贴、另存为、主题切换
 - **深色/浅色主题**：通过右键菜单切换，由 WASM 插件驱动
