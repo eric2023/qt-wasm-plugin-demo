@@ -20,8 +20,20 @@
  */
 
 #include <cstdint>
-#include <cstring>
 
+// 手写字符串长度和内存复制（避免 libc 导入）
+// __attribute__((optnone)) 防止编译器将循环优化为 strlen 调用
+__attribute__((noinline, optnone))
+static uint32_t my_strlen(const char* s) {
+    uint32_t len = 0;
+    while (s[len]) len++;
+    return len;
+}
+static void my_memcpy(void* dst, const void* src, uint32_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+}
 // ═══════════════════════════════════════════════════════════════
 // DTK 宿主导入函数声明
 // 这些函数由 DTK 宿主提供。WASM 模块通过 import 机制依赖它们。
@@ -78,7 +90,9 @@ extern "C" __attribute__((visibility("default")))
 uint32_t alloc(uint32_t size) {
     if (!heap_base) {
         // 首次调用：初始化堆基址到静态数据之后
-        heap_base = (uint8_t*)__builtin_wasm_memory_size(0) * 65536;
+        // __builtin_wasm_memory_size 返回当前内存页数（每页 64KB）
+        uint32_t pages = (uint32_t)__builtin_wasm_memory_size(0);
+        heap_base = (uint8_t*)((uintptr_t)pages * 65536);
         heap_offset = 0;
         // 扩展内存以容纳堆
         if (__builtin_wasm_memory_grow(0, (size + 65535) / 65536) == -1) {
@@ -99,7 +113,7 @@ uint32_t alloc(uint32_t size) {
 extern "C" __attribute__((visibility("default")))
 int32_t build_ui() {
     // 设置窗口标题
-    dtk_set_window_title(STR_WINDOW_TITLE, (int32_t)strlen(STR_WINDOW_TITLE));
+    dtk_set_window_title(STR_WINDOW_TITLE, (int32_t)my_strlen(STR_WINDOW_TITLE));
 
     // 设置窗口尺寸
     dtk_set_window_size(600, 480);
@@ -108,11 +122,11 @@ int32_t build_ui() {
     int32_t mainLayout = dtk_create_hbox(0, 0);
 
     // 创建标题标签
-    int32_t titleLabel = dtk_create_label(STR_TITLE_LABEL, (int32_t)strlen(STR_TITLE_LABEL));
+    int32_t titleLabel = dtk_create_label(STR_TITLE_LABEL, (int32_t)my_strlen(STR_TITLE_LABEL));
     dtk_add_to_layout(mainLayout, titleLabel);
 
     // 创建状态标签
-    int32_t statusLabel = dtk_create_label(STR_STATUS_LABEL, (int32_t)strlen(STR_STATUS_LABEL));
+    int32_t statusLabel = dtk_create_label(STR_STATUS_LABEL, (int32_t)my_strlen(STR_STATUS_LABEL));
     dtk_add_to_layout(mainLayout, statusLabel);
 
     // 创建消息显示区（只读）
@@ -124,11 +138,11 @@ int32_t build_ui() {
     dtk_add_to_layout(mainLayout, hbox);
 
     // 创建输入框
-    int32_t inputField = dtk_create_lineedit(STR_PLACEHOLDER, (int32_t)strlen(STR_PLACEHOLDER));
+    int32_t inputField = dtk_create_lineedit(STR_PLACEHOLDER, (int32_t)my_strlen(STR_PLACEHOLDER));
     dtk_add_to_layout(hbox, inputField);
 
     // 创建发送按钮
-    int32_t sendButton = dtk_create_pushbutton(STR_SEND, (int32_t)strlen(STR_SEND));
+    int32_t sendButton = dtk_create_pushbutton(STR_SEND, (int32_t)my_strlen(STR_SEND));
     dtk_add_to_layout(hbox, sendButton);
 
     return mainLayout;
@@ -141,14 +155,14 @@ int32_t build_ui() {
 extern "C" __attribute__((visibility("default")))
 int32_t format_message(uint32_t ptr, uint32_t len) {
     // 分配 prefix + message 的空间
-    uint32_t prefixLen = (uint32_t)strlen(STR_PREFIX);
+    uint32_t prefixLen = (uint32_t)my_strlen(STR_PREFIX);
     uint32_t totalLen = prefixLen + len;
     uint32_t resultPtr = alloc(totalLen);
 
     // 复制前缀
-    memcpy((void*)(uintptr_t)resultPtr, STR_PREFIX, prefixLen);
+    my_memcpy((void*)(uintptr_t)resultPtr, STR_PREFIX, prefixLen);
     // 复制消息
-    memcpy((void*)(uintptr_t)(resultPtr + prefixLen), (void*)(uintptr_t)ptr, len);
+    my_memcpy((void*)(uintptr_t)(resultPtr + prefixLen), (void*)(uintptr_t)ptr, len);
 
     // 调用 DTK 宿主显示
     dtk_append_message((const char*)(uintptr_t)resultPtr, (int32_t)totalLen);

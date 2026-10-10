@@ -1,273 +1,861 @@
 # WASM 驱动的聊天应用（DTK）
 
-基于 Qt/DTK6 的聊天应用，前端 UI 和后端回复均由 WASM 插件驱动。
-WASM 插件以**进程插件**形式运行——WASM 在独立的 Node.js 子进程中执行，
-通过 JSON IPC 与 DTK 宿主通信。
+基于 Qt/DTK6 的聊天应用。**插件源码是 C++ 代码**，用 Emscripten 编译为 WASM。
+WASM 插件以**进程插件**形式运行——在独立的 Node.js 子进程中执行，
+通过 JSON IPC 与 DTK 宿主通信。**插件崩溃不影响主程序。**
 
 ## 架构总览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     DTK 客户端进程                        │
-│                                                          │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │     WASM UI 插件 (chat_ui_dtk.wasm)              │    │
-│  │     导入 11 个 DTK 宿主函数                        │    │
-│  │     没有 DTK 宿主，插件无法实例化！                 │    │
-│  └──────────────────────┬──────────────────────────┘    │
-│                         │ JSON IPC (stdin/stdout)        │
-│  ┌──────────────────────┴──────────────────────────┐    │
-│  │  WasmProcessBridge (QProcess)                    │    │
-│  │  → 启动 node wasm_dtk_host.js 子进程              │    │
-│  │  ← 接收 import 请求，调用 DTK 宿主回调             │    │
-│  │  → 返回 import_result                            │    │
-│  │  DTK 宿主创建: DLabel, DTextEdit,                │    │
-│  │  DLineEdit, DSuggestButton, DMenu                │    │
-│  └─────────────────────────────────────────────────┘    │
-│                          ↓ TCP                           │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           │ TCP (127.0.0.1:12345)
-                           ↓
-┌─────────────────────────────────────────────────────────┐
-│                      服务器进程                          │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  后端 WASM 插件 (random_reply.wasm)              │    │
-│  │  10 条预设回复，基于种子选择                       │    │
-│  │  通过 Node.js 桥接执行 (wasm_runner.js)          │    │
-│  └─────────────────────────────────────────────────┘    │
-│  Qt6 TCP 服务器 (ChatServer)                             │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       DTK 客户端进程                          │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  WASM UI 插件 (chat_ui_plugin.wasm)                  │    │
+│  │  C++ 源码 → Emscripten 编译 → WASM                    │    │
+│  │  导入 11 个 DTK 宿主函数 (env 模块)                    │    │
+│  │  没有 DTK 宿主，插件无法实例化！                        │    │
+│  └────────────────────┬────────────────────────────────┘    │
+│                       │ JSON IPC (stdin/stdout 行分隔)        │
+│  ┌────────────────────┴────────────────────────────────┐    │
+│  │  WasmProcessBridge (QProcess)                        │    │
+│  │    → 启动 node wasm_dtk_host.js 子进程                 │    │
+│  │    ← 接收 import 请求 → 调用 DTK 宿主回调              │    │
+│  │    → 返回 import_result                              │    │
+│  │  DTK 宿主创建: DLabel, DTextEdit,                     │    │
+│  │  DLineEdit, DSuggestButton, DMenu                     │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                       ↓ TCP (127.0.0.1:12345)                 │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+┌───────────────────────┴─────────────────────────────────────┐
+│                       服务器进程                               │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  后端 WASM 插件 (random_reply_plugin.wasm)           │    │
+│  │  C++ 源码 → Emscripten 编译 → WASM                    │    │
+│  │  自包含（零 import），10 条预设回复                      │    │
+│  │  通过 Node.js 桥接执行 (wasm_runner.js)               │    │
+│  └─────────────────────────────────────────────────────┘    │
+│  Qt6 TCP 服务器 (ChatServer)                                  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 进程插件架构（前端）
+### 进程隔离
 
-前端 WASM 插件通过 **Worker 线程 + SharedArrayBuffer** 实现同步导入调用：
+WASM 插件在**独立 Node.js 子进程**中运行，与主程序隔离：
+
+- **插件崩溃不影响主程序**——子进程崩溃后主程序仍可运行，可重启子进程
+- 主程序通过 `QProcess` 管理 WASM 子进程的 stdin/stdout
+- IPC 协议为行分隔 JSON（每行一个 JSON 对象，以 `\n` 分隔）
+
+### 进程插件同步桥接（前端）
+
+前端 WASM 插件需要同步调用 DTK 宿主函数并获取返回值。
+Node.js 主线程是异步的，WASM 在 Worker 线程中同步执行。
+通过 **SharedArrayBuffer + Atomics.wait/notify** 跨线程同步：
 
 ```
 DTK 客户端进程                     Node.js 子进程 (wasm_dtk_host.js)
-┌──────────────────┐             ┌─────────────────────────────────┐
-│ DtkChatClient    │  stdin →    │ 主线程                          │
-│  WasmProcessBridge│ ←stdout    │  readline 处理 stdin/stdout     │
-│                  │             │  轮询 SharedArrayBuffer          │
-│  handleDtkHostCall│ ←import    │  ↕ postMessage                  │
-│  → new DLabel(str)│ result→    │ Worker 线程                     │
-│                  │             │  WebAssembly.instantiate        │
-│                  │             │  chat_ui_dtk.wasm               │
-│                  │             │  import 函数 → Atomics.wait      │
-└──────────────────┘             └─────────────────────────────────┘
+┌──────────────────┐             ┌──────────────────────────────────┐
+│ DtkChatClient    │  stdin →    │ 主线程                            │
+│  WasmProcessBridge│ ←stdout    │  readline 异步处理 stdin/stdout   │
+│                  │             │  pollImport() 轮询 SharedArrayBuffer│
+│  handleDtkHostCall│ ←import    │  ↕ postMessage                   │
+│  → new DLabel(str)│ result→    │ Worker 线程                       │
+│  → 返回 widget_id │            │  WebAssembly.instantiate         │
+│                  │             │  chat_ui_plugin.wasm             │
+│                  │             │  import 函数:                     │
+│                  │             │    预读 WASM 内存字符串            │
+│                  │             │    → 写入 SharedArrayBuffer       │
+│                  │             │    → Atomics.notify(主线程)        │
+│                  │             │    → Atomics.wait(阻塞等结果)      │
+│                  │             │    ← 主线程写入 result            │
+│                  │             │    → Atomics.notify(唤醒)          │
+└──────────────────┘             └──────────────────────────────────┘
 ```
 
-WASM 导入函数在 Worker 线程中执行，需要 C++ 宿主的返回值。
-Worker 通过 `SharedArrayBuffer + Atomics.wait` 阻塞等待主线程，
-主线程轮询检测 import 请求，通过 stdout JSON 转发给 C++，
-收到 `import_result` 后写入 SharedArrayBuffer 并 `Atomics.notify` 唤醒 Worker。
+**预读字符串避免死锁**：带字符串参数的 import 函数（`dtk_create_label`、
+`dtk_create_lineedit`、`dtk_create_pushbutton`、`dtk_set_window_title`、
+`dtk_append_message`）在 Worker 端预读 WASM 线性内存中的字符串，
+附带在 import 请求中通过 SharedArrayBuffer 传给 C++ 宿主。
+这样 C++ 不需要回读 WASM 内存（那会导致死锁：C++ 阻塞等 stdout，
+Node 阻塞等 import_result）。
 
-带字符串参数的导入函数（`create_label`、`create_lineedit`、`create_pushbutton`、
-`set_window_title`、`append_message`）在 Worker 端预读 WASM 线性内存中的字符串，
-附带在 import 请求中发给 C++，避免 C++ 回读 WASM 内存导致死锁。
+### 服务器端 WASM 桥接（后端）
+
+后端 WASM 插件自包含（零 import），无需同步桥接。
+`WasmPluginLoader` 通过 `QProcess` 一次性调用 `wasm_runner.js`：
+
+```
+ChatServer (C++)
+  │
+  ├─ WasmPluginLoader::invoke("generate_reply", {seed: 42})
+  │    │
+  │    ├─ QProcess 启动 node wasm_runner.js
+  │    ├─ stdin 写入: {"wasm_path":"plugins/random_reply_plugin.wasm","action":"generate_reply","seed":42}
+  │    ├─ closeWriteChannel() → Node 读取 → 实例化 WASM → 调用 generate_reply(42)
+  │    └─ stdout 读取: {"success":true,"result":"WASM plugins are awesome!"}
+  │
+  └─ 返回回复文本
+```
+
+每次调用启动一个新 Node 进程（一次性模式），适合服务器低频调用场景。
 
 ## 关键设计决策
 
-### WASM 插件依赖 DTK
-前端 WASM 插件（`chat_ui_dtk.wasm`）声明了 11 条 `(import "dtk" ...)` 语句。
-没有 DTK 宿主提供这些导入函数，WASM 模块**无法实例化**。
-这是强制 DTK 依赖的机制——插件在结构上没有 DTK 就无法运行。
+### 1. 插件源码是 C++ 代码
 
-### 进程插件（非内嵌运行时）
-WASM 运行时**不在 DTK 进程内**——而是作为独立的 Node.js 子进程运行。
-这样 WASM 插件与宿主进程隔离，通过 JSON IPC 通信。
-服务器也不内嵌 WASM 运行时，同样使用 Node.js 桥接。
+WASM 插件源码是标准 C++ 文件（`chat_ui_plugin.cpp`、`random_reply_plugin.cpp`），
+用 **Emscripten (emcc)** 编译为 WASM。不是手写 WAT/汇编。
 
-### DTK 控件
+### 2. WASM 插件依赖 DTK
+
+前端 WASM 插件通过 `extern "C"` 声明 11 个 DTK 宿主函数：
+
+```cpp
+extern "C" {
+    int32_t dtk_create_label(const char* text, int32_t len);
+    int32_t dtk_create_textedit(int32_t readonly, int32_t unused);
+    // ... 共 11 个
+}
+```
+
+Emscripten 编译时，这些未定义符号通过 `-Wl,--import-undefined` 自动成为
+WASM import（位于 `env` 模块下）。没有 DTK 宿主提供这些 import，
+WASM 模块**无法实例化**——这就是 DTK 依赖的强制机制。
+
+验证：`chat_ui_plugin.wasm` 有 11 个 import，全部是 `env.dtk_*` 函数。
+
+### 3. 进程插件（进程隔离）
+
+WASM 运行时**不在 DTK 进程内**——作为独立 Node.js 子进程运行。
+插件崩溃不影响主程序，只需重启子进程。
+前端使用长驻子进程（`wasm_dtk_host.js`），后端使用一次性子进程（`wasm_runner.js`）。
+
+### 4. 无 libc 依赖
+
+插件使用手写 `my_strlen`/`my_memcpy`，用 `__attribute__((noinline, optnone))`
+防止编译器将循环优化为 `strlen`/`memcpy` 的 libc 调用。
+编译时用 `-nostdlib`，生成的 WASM 模块无 libc import。
+
+验证：`random_reply_plugin.wasm` 零 import；`chat_ui_plugin.wasm` 仅 11 个 DTK import。
+
+### 5. DTK 控件
+
 所有 UI 控件均为 DTK 控件：
-- `DMainWindow` — 主窗口
-- `DLabel` — 标题和状态标签
-- `DTextEdit` — 消息显示区（只读，深色主题）
-- `DLineEdit` — 消息输入框
-- `DSuggestButton` — 发送按钮
-- `DMenu` — 右键上下文菜单
 
-### 深色/浅色主题
-消息显示区使用显式的深色调色板（`QColor(30, 30, 30)` 背景，`QColor(220, 220, 220)` 文字）。
-主题切换通过 WASM 插件的 `toggle_theme` 导出函数实现，
+| 控件类 | 用途 |
+|--------|------|
+| `DMainWindow` | 主窗口 |
+| `DLabel` | 标题标签、状态标签 |
+| `DTextEdit` | 消息显示区（只读，深色主题） |
+| `DLineEdit` | 消息输入框 |
+| `DSuggestButton` | 发送按钮 |
+| `DMenu` | 右键上下文菜单 |
+
+### 6. 深色/浅色主题
+
+消息显示区使用显式调色板：
+
+- **深色**：`QColor(30, 30, 30)` 背景，`QColor(220, 220, 220)` 文字
+- **浅色**：`QColor(250, 250, 250)` 背景，`QColor(30, 30, 30)` 文字
+
+主题切换通过 WASM 插件的 `toggle_theme` 导出函数实现——
 该函数调用 `dtk_get_theme`/`dtk_set_theme` 宿主导入完成切换。
-
-## 功能特性
-
-- **WASM 定义 UI**：整个 UI 布局由 WASM 插件通过调用 DTK 宿主函数创建控件
-- **WASM 消息格式化**：消息在显示前先分配到 WASM 线性内存中
-- **WASM 后端**：服务器使用 WASM 插件生成随机回复
-- **右键上下文菜单**：复制、粘贴、另存为、主题切换
-- **深色/浅色主题**：通过右键菜单切换，由 WASM 插件驱动
-- **TCP 通信**：客户端连接服务器，发送消息，接收随机回复
-- **自动重连**：断线后客户端自动重连
+`applyThemeColors()` 在 `DTextEdit` 及其 viewport 上设置调色板和样式表，
+对所有子控件 `unpolish`/`polish` 强制刷新。
 
 ## 文件结构
 
 ```
 wasm/
-├── CMakeLists.txt              # CMake 构建配置
-├── README.md                   # 本文件
-├── package.json                # Node.js 依赖声明（wabt 用于 WAT→WASM 编译）
-├── package-lock.json           # npm 依赖锁定文件
+├── CMakeLists.txt                  # CMake 构建配置（3 个目标）
+├── README.md                       # 本文件
+├── package.json                    # npm 脚本（build:plugins → compile_plugins.sh）
 │
-├── plugins/                    # WASM 插件源码与编译产物
-│   ├── chat_ui_dtk.wat         # 前端 WASM 插件（WAT 源码）
-│   ├── chat_ui_dtk.wasm        # 前端 WASM 插件（编译后二进制）
-│   ├── random_reply.wat        # 后端 WASM 插件（WAT 源码）
-│   └── random_reply.wasm       # 后端 WASM 插件（编译后二进制）
+├── plugins/                        # WASM 插件
+│   ├── chat_ui_plugin.cpp          # 前端 UI 插件 C++ 源码
+│   ├── chat_ui_plugin.wasm         # 编译产物（Emscripten，~1.3KB）
+│   ├── random_reply_plugin.cpp     # 后端回复插件 C++ 源码
+│   └── random_reply_plugin.wasm    # 编译产物（Emscripten，~775B）
 │
-├── scripts/                    # 构建与运行脚本
-│   ├── build_plugins.js        # 使用 wabt 编译所有 .wat → .wasm
-│   ├── wasm_dtk_host.js        # 前端 WASM 进程插件运行时（Worker + SAB）
-│   └── wasm_runner.js          # 服务器端 WASM 执行的 Node.js 桥接
+├── scripts/
+│   ├── compile_plugins.sh          # Emscripten 编译脚本
+│   ├── wasm_dtk_host.js            # 前端 WASM 进程插件运行时（主线程+Worker）
+│   └── wasm_runner.js              # 服务器端 WASM 一次性执行桥接
 │
-├── src/                        # C++ 源代码
-│   ├── dtk_client_main.cpp     # DTK 客户端入口（DApplication）
-│   ├── DtkChatClient.h         # DTK 客户端核心：WasmProcessBridge + DTK 宿主导入 + UI 逻辑
-│   ├── WasmProcessBridge.h     # QProcess 包装：管理 wasm_dtk_host.js，JSON IPC，DTK 宿主回调分发
-│   ├── server_main.cpp         # 服务器入口
-│   ├── ChatServer.h            # Qt6 TCP 服务器 + WASM 后端插件（仅头文件）
-│   ├── ChatServer.cpp          # ChatServer 桩文件（类定义在头文件中）
-│   ├── WasmPluginLoader.h      # 基于 QProcess 的 WASM 桥接（服务器用，仅头文件）
-│   └── WasmPluginLoader.cpp    # WasmPluginLoader 桩文件（类定义在头文件中）
+├── src/                            # C++ 源代码
+│   ├── dtk_client_main.cpp         # DTK 客户端入口
+│   ├── DtkChatClient.h             # DTK 客户端核心（仅头文件，554 行）
+│   ├── WasmProcessBridge.h         # QProcess WASM 桥接（仅头文件，278 行）
+│   ├── server_main.cpp             # 服务器入口
+│   ├── ChatServer.h                # Qt6 TCP 服务器（仅头文件，153 行）
+│   ├── ChatServer.cpp              # ChatServer 桩文件
+│   ├── WasmPluginLoader.h          # 服务器 WASM 桥接（仅头文件，148 行）
+│   └── WasmPluginLoader.cpp        # WasmPluginLoader 桩文件
 │
 └── tests/
-    └── test_e2e.cpp            # 端到端测试：发送 5 条消息 → 验证回复
+    └── test_e2e.cpp                # 端到端测试
 ```
 
-### 各文件说明
+## 各文件说明
 
-#### 构建与配置
+### WASM 插件（`plugins/`）
 
-| 文件 | 说明 |
-|------|------|
-| `CMakeLists.txt` | CMake 构建配置。定义 3 个构建目标：`dtkchatclient`（DTK6 + WasmProcessBridge）、`wasmchatserver`（Qt6 Network）、`test_e2e`。 |
-| `package.json` | 声明 `wabt` 依赖用于 WAT→WASM 编译。提供 `npm run build:plugins` 脚本。 |
+#### `chat_ui_plugin.cpp` — 前端 UI 插件 C++ 源码
 
-#### WASM 插件（`plugins/`）
+用 Emscripten 编译为 `chat_ui_plugin.wasm`。通过 `extern "C"` 声明 11 个 DTK 宿主函数
+（编译为 WASM import），导出 4 个函数供宿主通过 IPC 调用。
 
-| 文件 | 说明 |
-|------|------|
-| `chat_ui_dtk.wat` | **前端 WASM 插件（WAT 源码）。** 声明 11 条 `(import "dtk" ...)` 语句，从结构上依赖 DTK。导出 4 个函数：`build_ui()`、`alloc(size)`、`format_and_display(ptr, len)`、`toggle_theme()`。 |
-| `random_reply.wat` | **后端 WASM 插件（WAT 源码）。** 自包含（无导入）。导出 `generate_reply(seed)` 函数，基于 `seed % 10` 从 10 条预设回复中选择一条返回。 |
+**静态字符串数据**（编译时放入 WASM linear memory 的 data segment）：
 
-#### 脚本（`scripts/`）
+| 常量 | 值 | 用途 |
+|------|-----|------|
+| `STR_WINDOW_TITLE` | `"WASM-Powered Chat (DTK)"` | 窗口标题 |
+| `STR_TITLE_LABEL` | `"WASM-Powered Chat Client (DTK)"` | 标题标签 |
+| `STR_STATUS_LABEL` | `"Initializing..."` | 状态标签 |
+| `STR_PLACEHOLDER` | `"Type your message here..."` | 输入框占位文本 |
+| `STR_SEND` | `"Send"` | 按钮文本 |
+| `STR_PREFIX` | `"[Me] "` | 消息前缀 |
 
-| 文件 | 说明 |
-|------|------|
-| `build_plugins.js` | 使用 `wabt` npm 包将所有 `plugins/*.wat` 编译为 `*.wasm`。 |
-| `wasm_dtk_host.js` | **前端 WASM 进程插件运行时。** 主线程 + Worker 线程架构。Worker 线程加载 `chat_ui_dtk.wasm` 并同步执行导出函数；WASM 导入函数通过 `SharedArrayBuffer + Atomics.wait/notify` 与主线程同步通信；主线程通过 `readline` 处理 stdin/stdout JSON 行协议，转发 import 请求到 C++ 父进程。 |
-| `wasm_runner.js` | 服务器端 WASM 执行的 Node.js 桥接脚本。由 `WasmPluginLoader` 通过 `QProcess` 调用。 |
-
-#### 客户端源码（`src/`）
-
-| 文件 | 说明 |
-|------|------|
-| `dtk_client_main.cpp` | DTK 客户端入口。创建 `DApplication`，配置 DDE 平台集成，实例化 `DtkChatClient`，显示窗口，进入事件循环。 |
-| `DtkChatClient.h` | **DTK 客户端核心类（仅头文件）。** 通过 `WasmProcessBridge` 加载 `chat_ui_dtk.wasm`。`handleDtkHostCall(func, a1, a2, str)` 处理 11 个 DTK 导入命令：创建控件/布局、设置窗口属性、获取/设置主题、追加消息。`str` 参数由 JS 端预读 WASM 内存后通过 IPC 传递，避免 C++ 回读内存导致死锁。包含右键上下文菜单（复制/粘贴/另存为/主题切换）、深色/浅色主题、TCP 通信与自动重连。 |
-| `WasmProcessBridge.h` | **QProcess 包装类（仅头文件）。** 管理 `wasm_dtk_host.js` 子进程。发送 JSON 行到 stdin，读取 JSON 行从 stdout。收到 `import` 消息时调用 `s_hostCallback`（DTK 宿主回调），将返回值作为 `import_result` 发回。API：`load()`、`callExport()`、`callExport_i32()`、`callExport_ii()`、`readMemory()`、`writeMemory()`、`readString()`、`writeString()`、`alloc()`。 |
-
-#### 服务器源码（`src/`）
-
-| 文件 | 说明 |
-|------|------|
-| `server_main.cpp` | 服务器入口。从 argv 解析端口号（默认 12345），实例化 `ChatServer`，进入事件循环。 |
-| `ChatServer.h` | **Qt6 TCP 服务器（仅头文件）。** 监听端口，接受连接，读取换行分隔的 JSON 消息。收到 `{"text":"..."}` 后，通过 `WasmPluginLoader` 加载 `random_reply.wasm`，以种子生成随机回复。 |
-| `WasmPluginLoader.h` | **基于 QProcess 的 WASM 桥接（仅头文件）。** 启动 `node wasm_runner.js` 子进程，通过 stdin/stdout JSON 通信执行 `random_reply.wasm`。 |
-
-#### 测试（`tests/`）
-
-| 文件 | 说明 |
-|------|------|
-| `test_e2e.cpp` | 端到端测试。连接服务器，发送 5 条消息，验证每条消息都收到包含回显 + 随机回复 + 种子的响应。 |
-
-## 构建
-
-### 前置依赖
-- Qt 6.8.0
-- DTK6 6.7.49（`libdtk6core-dev`、`libdtk6widget-dev`、`libdtk6gui-dev`）
-- CMake 3.16+
-- Node.js（用于 WAT→WASM 编译和 WASM 进程插件运行时）
-
-### 构建步骤
-
-```bash
-# 1. 编译 WASM 插件（WAT → WASM）
-npm install
-node scripts/build_plugins.js
-
-# 2. 编译所有 C++ 目标
-cd build && cmake .. && make -j$(nproc)
-```
-
-### 构建目标
-- `dtkchatclient` — DTK 客户端，通过 WasmProcessBridge 运行 WASM 进程插件
-- `wasmchatserver` — TCP 服务器，使用 WASM 后端插件
-- `test_e2e` — 端到端测试
-
-## 运行
-
-```bash
-# 启动服务器
-./build/wasmchatserver 12345 &
-
-# 运行 DTK 客户端
-DISPLAY=:0 QT_QPA_PLATFORM=xcb ./build/dtkchatclient
-
-# 运行端到端测试
-./build/test_e2e 127.0.0.1 12345
-```
-
-> **注意**：在 DDE 上需使用 `QT_QPA_PLATFORM=xcb` 以正确渲染窗口。
-
-## WASM 插件
-
-| 插件 | 文件 | 用途 |
-|------|------|------|
-| 聊天 UI（DTK） | `plugins/chat_ui_dtk.wat` | 通过调用 DTK 宿主导入函数定义 UI |
-| 随机回复 | `plugins/random_reply.wat` | 服务器端随机回复生成 |
-
-## DTK 宿主函数
-
-WASM UI 插件从 "dtk" 模块导入以下函数：
+**导出函数**：
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
-| `dtk_create_label` | `(i32, i32) → i32` | 创建 DLabel（字符串指针, 字符串长度）→ 控件 ID |
-| `dtk_create_textedit` | `(i32, i32) → i32` | 创建 DTextEdit（是否只读, 未使用）→ 控件 ID |
-| `dtk_create_lineedit` | `(i32, i32) → i32` | 创建 DLineEdit（字符串指针, 字符串长度）→ 控件 ID |
-| `dtk_create_pushbutton` | `(i32, i32) → i32` | 创建 DSuggestButton（字符串指针, 字符串长度）→ 控件 ID |
-| `dtk_create_hbox` | `(i32, i32) → i32` | 创建 QHBoxLayout（标志位, 未使用）→ 布局 ID |
-| `dtk_add_to_layout` | `(i32, i32) → i32` | 将控件添加到布局（布局 ID, 控件 ID） |
-| `dtk_set_window_title` | `(i32, i32) → i32` | 设置窗口标题（字符串指针, 字符串长度） |
-| `dtk_set_window_size` | `(i32, i32) → i32` | 设置窗口尺寸（宽度, 高度） |
-| `dtk_get_theme` | `() → i32` | 获取当前主题（0=浅色, 1=深色） |
-| `dtk_set_theme` | `(i32, i32) → i32` | 设置主题（主题值, 未使用） |
-| `dtk_append_message` | `(i32, i32) → i32` | 追加消息到显示区（字符串指针, 字符串长度） |
+| `build_ui()` | `() → i32` | 调用 DTK 宿主函数创建全部 UI 控件（窗口标题/尺寸、2 个标签、文本编辑器、水平布局、输入框、按钮），返回主布局 ID |
+| `format_message(ptr, len)` | `(i32, i32) → i32` | 在 WASM 内存中拼接 `"[Me] " + 消息`，调用 `dtk_append_message` 显示 |
+| `toggle_theme()` | `() → i32` | 调用 `dtk_get_theme` 获取当前主题，调用 `dtk_set_theme` 切换，返回旧主题值 |
+| `alloc(size)` | `(i32) → i32` | WASM 线性内存 bump 分配器，宿主通过 IPC 调用来分配内存 |
 
-## 右键上下文菜单
+**`build_ui()` 执行序列**（14 次 DTK 宿主调用）：
 
-在窗口任意位置右键可访问：
-- **复制** — 从消息区或输入框复制选中的文本
-- **粘贴** — 将剪贴板内容粘贴到输入框
-- **另存为...** — 将聊天记录保存到文本文件
-- **主题切换** — 在浅色和深色主题之间切换
+```
+1. dtk_set_window_title("WASM-Powered Chat (DTK)")
+2. dtk_set_window_size(600, 480)
+3. dtk_create_hbox(0, 0)              → mainLayout = 0（主垂直布局）
+4. dtk_create_label("WASM-Powered Chat Client (DTK)")  → titleLabel = 1
+5. dtk_add_to_layout(0, 1)            → 标题标签加入主布局
+6. dtk_create_label("Initializing...")  → statusLabel = 2
+7. dtk_add_to_layout(0, 2)            → 状态标签加入主布局
+8. dtk_create_textedit(1, 0)          → textEdit = 3（只读）
+9. dtk_add_to_layout(0, 3)            → 消息显示区加入主布局
+10. dtk_create_hbox(1, 0)             → hbox = 4（输入行水平布局）
+11. dtk_add_to_layout(0, 4)           → 输入行加入主布局
+12. dtk_create_lineedit("Type your message here...")  → inputField = 5
+13. dtk_add_to_layout(4, 5)           → 输入框加入输入行
+14. dtk_create_pushbutton("Send")     → sendButton = 6
+15. dtk_add_to_layout(4, 6)           → 发送按钮加入输入行
+返回 mainLayout (0)
+```
+
+#### `random_reply_plugin.cpp` — 后端回复插件 C++ 源码
+
+自包含（零 import），导出 `generate_reply(seed)` 和 `get_reply_len(seed)`。
+10 条预设回复，基于 `seed % 10` 选择。
+
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `generate_reply(seed)` | `(i32) → i32` | 根据 `seed % 10` 选择回复，复制到堆内存，返回指针 |
+| `get_reply_len(seed)` | `(i32) → i32` | 返回指定 seed 对应回复的字符串长度 |
+
+预设回复：
+```
+0: "Hello! Nice to meet you."
+1: "That's interesting!"
+2: "WASM plugins are awesome!"
+3: "Tell me more about it."
+4: "I'm a WASM-powered server."
+5: "Qt and WASM work great together!"
+6: "Let me think about that..."
+7: "Great question!"
+8: "Processing your request..."
+9: "Goodbye! See you next time."
+```
+
+### 脚本（`scripts/`）
+
+#### `compile_plugins.sh` — Emscripten 编译脚本
+
+用 `emcc` 将 C++ 插件源码编译为 WASM。
+
+**前端插件编译参数**：
+
+| 参数 | 说明 |
+|------|------|
+| `-O2` | 优化级别 |
+| `-s WASM=1` | 生成独立 .wasm 文件 |
+| `-s ALLOW_MEMORY_GROWTH=1` | 允许线性内存动态增长 |
+| `-s EXPORTED_FUNCTIONS='["_build_ui","_format_message","_toggle_theme","_alloc"]'` | 导出函数 |
+| `-s ERROR_ON_UNDEFINED_SYMBOLS=0` | 允许未定义符号（DTK 宿主导入） |
+| `-nostdlib` | 不链接标准库（避免 libc import） |
+| `-Wl,--no-entry` | 无入口点（纯库模块） |
+| `-Wl,--import-undefined` | 未定义符号编译为 WASM import |
+
+后端插件参数相同（无 `--import-undefined`，因为自包含）。
+
+#### `wasm_dtk_host.js` — 前端 WASM 进程插件运行时
+
+长驻 Node.js 子进程，主线程 + Worker 线程架构。
+
+**SharedArrayBuffer 布局**（4120 字节）：
+
+| 偏移 | 大小 | 用途 |
+|------|------|------|
+| 0 | 4 | TAG: 0=idle, 1=import 请求就绪 |
+| 4 | 4 | 函数名长度 |
+| 8 | 32 | 函数名（UTF-8） |
+| 40 | 4 | 参数 1 (arg1) |
+| 44 | 4 | 参数 2 (arg2) |
+| 48 | 4 | 字符串长度 |
+| 52 | 4096 | 字符串数据（UTF-8） |
+| 4116 | 4 | 结果值 (result) |
+
+**Worker 线程**：
+1. 读取 WASM 二进制，构建 11 个 DTK import 函数（`makeDtkImport`）
+2. `WebAssembly.instantiate` 实例化（import 对象提供在 `env` 模块下）
+3. 收到 `call` 消息时同步执行 WASM 导出函数
+4. WASM import 函数执行时：预读字符串 → 写入 SAB → `Atomics.notify` → `Atomics.wait` 阻塞
+
+**主线程**：
+1. `readline` 异步处理 stdin/stdout JSON 行协议
+2. 收到 C++ 的 `call`/`read_memory`/`write_memory` 请求 → 转发给 Worker
+3. `pollImport()` 轮询 SAB，检测到 import 请求 → 通过 stdout 转发给 C++
+4. 收到 C++ 的 `import_result` → 写入 SAB → `Atomics.notify` 唤醒 Worker
+
+#### `wasm_runner.js` — 服务器端 WASM 桥接
+
+一次性 Node.js 脚本，由 `WasmPluginLoader` 通过 `QProcess` 调用。
+从 stdin 读取完整 JSON 请求，加载 WASM，执行函数，通过 stdout 返回结果。
+后端插件零 import，无需同步桥接。
+
+### 客户端源码（`src/`）
+
+#### `dtk_client_main.cpp` — DTK 客户端入口
+
+创建 `DApplication`，配置 DDE 平台集成，实例化 `DtkChatClient`，显示窗口，进入事件循环。
+
+#### `DtkChatClient.h` — DTK 客户端核心（仅头文件，554 行）
+
+继承 `DMainWindow`，是 DTK 宿主和聊天逻辑的核心。
+
+**构造函数流程**：
+1. 创建 centralWidget + `QVBoxLayout`（主布局容器）
+2. 注册 `WasmProcessBridge::s_hostCallback` → `handleDtkHostCall`
+3. `WasmProcessBridge::load("plugins/chat_ui_plugin.wasm")` 启动 Node 子进程
+4. `callExport("build_ui")` 触发 WASM 执行，创建全部 UI 控件
+5. `applyThemeColors()` 应用深色/浅色主题
+6. 连接 Send 按钮和输入框的信号
+7. 创建 `QTcpSocket`，500ms 后自动连接服务器
+
+**`handleDtkHostCall(func, a1, a2, str)`** — 处理 11 个 DTK 导入命令：
+
+| 命令 | C++ 动作 | 返回值 |
+|------|---------|--------|
+| `dtk_create_label` | `new DLabel(str, this)`，首个标签设粗体 14pt | 控件 ID |
+| `dtk_create_textedit` | `new DTextEdit`，设只读，安装事件过滤器 | 控件 ID |
+| `dtk_create_lineedit` | `new DLineEdit`，设占位文本，初始禁用 | 控件 ID |
+| `dtk_create_pushbutton` | `new DSuggestButton(str)`，初始禁用 | 控件 ID |
+| `dtk_create_hbox` | `a1==0` 返回 0（用预建主布局），否则 `new QHBoxLayout` | 布局 ID |
+| `dtk_add_to_layout` | 查找布局和控件注册表，`addWidget`/`addLayout` | 0 |
+| `dtk_set_window_title` | `setWindowTitle(str)` | 0 |
+| `dtk_set_window_size` | `resize(a1, a2)` | 0 |
+| `dtk_get_theme` | 返回当前主题（0=浅色, 1=深色） | 主题值 |
+| `dtk_set_theme` | 设置 `DGuiApplicationHelper` 调色板类型，调用 `applyThemeColors` | 0 |
+| `dtk_append_message` | `appendMessage(str)` 添加带时间戳的消息 | 0 |
+
+控件/布局通过 `QMap<int32_t, QWidget*> m_widgets` 和
+`QMap<int32_t, QHBoxLayout*> m_layouts` 注册管理，
+WASM 返回的 ID 是后续 `add_to_layout` 的引用句柄。
+
+**右键上下文菜单**（`showContextMenu`）：
+- **Copy** — 从消息区或输入框复制选中文本
+- **Paste** — 粘贴剪贴板到输入框
+- **Save As...** — `DFileDialog` 保存聊天记录到文本文件
+- **Theme Toggle** — 调用 WASM `toggle_theme` 导出函数切换主题
+
+**消息发送**（`onSendClicked`）：
+1. 通过 `m_wasm->alloc()` 在 WASM 内存分配空间
+2. `m_wasm->writeString()` 写入消息文本
+3. `m_wasm->readString()` 读回验证
+4. `appendMessage("[Me] " + wasmText)` 本地显示
+5. 通过 TCP 发送 JSON `{"text":"..."}` 到服务器
+
+**消息接收**（`onReadyRead`）：
+- 读取 TCP 数据，解析 JSON，`appendMessage("[Server] " + text)`
+
+**TCP 通信**：
+- 自动连接 `127.0.0.1:12345`
+- 断线后 3 秒自动重连
+- 连接/断线/错误状态更新到状态标签
+
+**后备 UI**（`buildFallbackUi`）：
+WASM 加载失败时用 C++ 直接创建相同的 UI 控件，保证应用可用。
+
+#### `WasmProcessBridge.h` — QProcess WASM 桥接（仅头文件，278 行）
+
+管理 `wasm_dtk_host.js` 子进程的生命周期和 IPC 通信。
+
+**API**：
+
+| 方法 | 说明 |
+|------|------|
+| `load(wasmPath)` | 启动 Node 子进程，等待 WASM 加载就绪 |
+| `callExport(func, *out)` | 调用 0 参数 WASM 导出函数 |
+| `callExport_i32(func, arg, *out)` | 调用 1 参数 WASM 导出函数 |
+| `callExport_ii(func, arg1, arg2, *out)` | 调用 2 参数 WASM 导出函数 |
+| `readMemory(offset, len)` | 读取 WASM 线性内存 |
+| `writeMemory(offset, data)` | 写入 WASM 线性内存 |
+| `readString(offset, len)` | 从 WASM 内存读取字符串 |
+| `writeString(offset, str)` | 写入字符串到 WASM 内存 |
+| `alloc(size)` | 调用 WASM `alloc` 导出函数 |
+| `isAlive()` | 检查子进程是否存活 |
+
+**`sendAndProcess(request)`** — 核心通信循环：
+1. 写 JSON 请求到子进程 stdin
+2. 循环读取 stdout 行：
+   - `import` → 调用 `s_hostCallback`，返回 `import_result`
+   - `call_result` → 返回给调用者
+   - `error` → 返回错误
+
+`readLineSync(timeoutMs)` 使用 `waitForReadyRead` + `readAll` 同步读取一行 JSON。
+
+回调类型：`std::function<int32_t(const QString &func, int32_t arg1, int32_t arg2, const QString &str)>`，
+`str` 由 JS 端预读 WASM 内存后通过 IPC 传递。
+
+### 服务器源码（`src/`）
+
+#### `server_main.cpp` — 服务器入口
+
+从 `argv` 解析端口号（默认 12345），实例化 `ChatServer`，进入事件循环。
+
+#### `ChatServer.h` — Qt6 TCP 服务器（仅头文件，153 行）
+
+监听端口，接受连接，读取换行分隔的 JSON 消息。
+
+**消息处理流程**：
+1. 解析 `{"text":"用户消息"}` JSON
+2. 生成种子：`seed = timestamp_ms ⊕ (counter × 2654435761) ⊕ message_length`
+3. 调用 `WasmPluginLoader::invoke("generate_reply", {seed})` 执行后端 WASM 插件
+4. 返回 `{"text":"回复","echo":"原文","seed":种子}`
+
+#### `WasmPluginLoader.h` — 服务器 WASM 桥接（仅头文件，148 行）
+
+通过 `QProcess` 一次性调用 `wasm_runner.js`。
+`invoke(action, params)` 方法：
+1. 构建 JSON 请求 `{wasm_path, action, ...params}`
+2. `QProcess` 启动 `node wasm_runner.js`
+3. stdin 写入 JSON，`closeWriteChannel()`
+4. `QEventLoop` + `QTimer` 同步等待完成（超时 10s）
+5. 解析 stdout JSON，返回 `result` 字段
+
+### 测试（`tests/`）
+
+#### `test_e2e.cpp` — 端到端测试
+
+连接服务器，依次发送 5 条测试消息：
+```
+"Hello WASM Server!"
+"Tell me about WebAssembly"
+"How does Qt work with WASM?"
+"What is linear memory?"
+"Goodbye!"
+```
+验证每条消息都收到包含 `echo`（回显）、`text`（随机回复）、`seed`（种子）的 JSON 响应。
+全部收到后输出 `E2E Test PASSED` 并退出。
+
+### 构建配置
+
+#### `CMakeLists.txt`
+
+3 个构建目标：
+
+| 目标 | 源文件 | 链接库 | 说明 |
+|------|--------|--------|------|
+| `dtkchatclient` | `dtk_client_main.cpp`, `DtkChatClient.h`, `WasmProcessBridge.h` | Qt6::Core/Network/Widgets, Dtk6::Widget/Gui/Core | DTK 客户端 |
+| `wasmchatserver` | `server_main.cpp`, `ChatServer.h/.cpp`, `WasmPluginLoader.h/.cpp` | Qt6::Core/Network | TCP 服务器 |
+| `test_e2e` | `test_e2e.cpp` | Qt6::Core/Network | 端到端测试 |
+
+使用 `CMAKE_AUTOMOC ON`，`C++17` 标准。
+
+#### `package.json`
+
+```json
+{
+  "name": "wasm-chat",
+  "version": "1.0.0",
+  "scripts": {
+    "build:plugins": "bash scripts/compile_plugins.sh"
+  }
+}
+```
+
+## 编译与运行
+
+### 环境要求
+
+| 依赖 | 验证版本 | 用途 |
+|------|---------|------|
+| Qt6 | 6.8.0 | C++ GUI 框架（Core / Network / Widgets） |
+| DTK6 | 6.7.49 | Deepin 工具套件（Widget / Gui / Core） |
+| CMake | 3.31.4 | C++ 构建系统 |
+| g++ | 12.3.0 | C++ 编译器 |
+| Node.js | v24.7.0 | WASM 进程插件运行时 |
+| Emscripten | 6.0.12 | C++ → WASM 编译器（emcc） |
+
+### 第一步：安装并激活 Emscripten
+
+```bash
+cd /home/ut000520@uos/Desktop
+git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+cd emsdk
+./emsdk install latest
+./emsdk activate latest
+```
+
+每次新终端会话使用前，需激活 Emscripten 环境：
+
+```bash
+source /home/ut000520@uos/Desktop/emsdk/emsdk_env.sh
+```
+
+验证：
+
+```bash
+emcc --version    # 应输出 emcc 6.0.12
+```
+
+### 第二步：编译 C++ 插件源码为 WASM
+
+```bash
+cd /home/ut000520@uos/Desktop/wasm
+source /home/ut000520@uos/Desktop/emsdk/emsdk_env.sh
+bash scripts/compile_plugins.sh
+```
+
+输出：
+
+```
+=== Compiling chat_ui_plugin.cpp ===
+  → /home/ut000520@uos/Desktop/wasm/plugins/chat_ui_plugin.wasm
+=== Compiling random_reply_plugin.cpp ===
+  → /home/ut000520@uos/Desktop/wasm/plugins/random_reply_plugin.wasm
+=== Done! ===
+```
+
+验证 WASM 模块的 import/export：
+
+```bash
+node -e '
+const fs = require("fs");
+async function check(file) {
+    const mod = await WebAssembly.compile(new Uint8Array(fs.readFileSync(file)));
+    const imports = WebAssembly.Module.imports(mod);
+    const exports = WebAssembly.Module.exports(mod);
+    console.log(file);
+    console.log("  imports:", imports.length ? imports.map(i => i.module+"."+i.name).join(", ") : "none");
+    console.log("  exports:", exports.map(e => e.name).join(", "));
+}
+check("plugins/chat_ui_plugin.wasm").then(() => check("plugins/random_reply_plugin.wasm"));
+'
+```
+
+预期输出：
+
+```
+plugins/chat_ui_plugin.wasm
+  imports: env.dtk_set_window_title, env.dtk_set_window_size, env.dtk_create_hbox, env.dtk_create_label, env.dtk_add_to_layout, env.dtk_create_textedit, env.dtk_create_lineedit, env.dtk_create_pushbutton, env.dtk_append_message, env.dtk_get_theme, env.dtk_set_theme
+  exports: memory, __indirect_function_table, alloc, build_ui, format_message, toggle_theme
+plugins/random_reply_plugin.wasm
+  imports: none
+  exports: memory, __indirect_function_table, generate_reply, get_reply_len
+```
+
+### 第三步：编译 C++ 目标
+
+```bash
+cd /home/ut000520@uos/Desktop/wasm
+mkdir -p build && cd build
+cmake ..
+make -j$(nproc)
+```
+
+输出：
+
+```
+[ 76%] Built target wasmchatserver
+[ 88%] Built target test_e2e
+[100%] Built target dtkchatclient
+```
+
+生成 3 个可执行文件：
+
+| 文件 | 说明 |
+|------|------|
+| `build/dtkchatclient` | DTK 客户端（WASM 前端 UI 插件） |
+| `build/wasmchatserver` | TCP 服务器（WASM 后端回复插件） |
+| `build/test_e2e` | 端到端测试 |
+
+### 第四步：运行
+
+> **重要**：所有程序必须从**项目根目录**（`/home/ut000520@uos/Desktop/wasm`）运行，
+> 因为程序内部使用相对路径查找 `plugins/*.wasm` 和 `scripts/*.js`。
+
+```bash
+cd /home/ut000520@uos/Desktop/wasm
+
+# 1. 启动服务器（后台运行，监听 12345 端口）
+./build/wasmchatserver 12345 &
+
+# 2. 启动 DTK 客户端（前台运行，自动连接 127.0.0.1:12345）
+DISPLAY=:0 QT_QPA_PLATFORM=xcb ./build/dtkchatclient
+```
+
+服务器启动输出：
+
+```
+[ChatServer] Backend WASM plugin loaded: plugins/random_reply_plugin.wasm
+[ChatServer] Listening on port 12345
+WASM Chat Server running. Press Ctrl+C to quit.
+```
+
+客户端启动输出：
+
+```
+[WasmProcessBridge] Node process started, WASM plugin loaded: "plugins/chat_ui_plugin.wasm"
+WASM UI plugin loaded — calling build_ui()...
+[DTK Host] Set window title: "WASM-Powered Chat (DTK)"
+[DTK Host] Set window size: 600 x 480
+[DTK Host] Main vertical layout (id: 0)
+[DTK Host] Created label: "WASM-Powered Chat Client (DTK)" id: 1
+[DTK Host] add_to_layout layout: 0 widget: 1
+[DTK Host] Created label: "Initializing..." id: 2
+[DTK Host] add_to_layout layout: 0 widget: 2
+[DTK Host] Created text_edit (readonly= 1 ) id: 3
+[DTK Host] add_to_layout layout: 0 widget: 3
+[DTK Host] Created hbox id: 4 flag: 1
+[DTK Host] add_to_layout layout: 0 widget: 4
+[DTK Host] Created line_edit: "Type your message here..." id: 5
+[DTK Host] add_to_layout layout: 4 widget: 5
+[DTK Host] Created push_button id: 6
+[DTK Host] add_to_layout layout: 4 widget: 6
+UI built by WASM plugin, layout ID: 0
+```
+
+### 第五步：端到端测试
+
+```bash
+cd /home/ut000520@uos/Desktop/wasm
+
+# 确保服务器正在运行
+./build/wasmchatserver 12345 &
+sleep 2
+
+# 运行测试（发送 5 条消息，验证回复）
+./build/test_e2e 127.0.0.1 12345
+```
+
+预期输出：
+
+```
+=== WASM Chat E2E Test ===
+Connecting to 127.0.0.1:12345...
+[OK] Connected to server!
+
+[SENT] Hello WASM Server!
+[RECV] Echo: Hello WASM Server!
+[RECV] Reply: That's interesting!
+[RECV] Seed: 590935161
+
+[SENT] Tell me about WebAssembly
+[RECV] Echo: Tell me about WebAssembly
+[RECV] Reply: WASM plugins are awesome!
+[RECV] Seed: 1024429862
+...
+[SENT] Goodbye!
+[RECV] Echo: Goodbye!
+[RECV] Reply: Processing your request...
+[RECV] Seed: 1541741088
+
+=== All messages sent! ===
+=== E2E Test PASSED ===
+[INFO] Disconnected
+```
+
+> 回复内容由 `seed % 10` 选择，每次运行结果不同。
+
+### 快速参考（完整流程）
+
+```bash
+cd /home/ut000520@uos/Desktop/wasm
+
+# 1. 激活 Emscripten
+source /home/ut000520@uos/Desktop/emsdk/emsdk_env.sh
+
+# 2. 编译 WASM 插件
+bash scripts/compile_plugins.sh
+
+# 3. 编译 C++ 目标
+mkdir -p build && cd build && cmake .. && make -j$(nproc) && cd ..
+
+# 4. 启动服务器
+./build/wasmchatserver 12345 &
+sleep 2
+
+# 5. 启动客户端（另一个终端）
+DISPLAY=:0 QT_QPA_PLATFORM=xcb ./build/dtkchatclient
+
+# 6. 运行测试（另一个终端）
+./build/test_e2e 127.0.0.1 12345
+
+# 7. 停止服务器
+kill %1 2>/dev/null  # 或 pkill -f wasmchatserver
+```
+
+> **注意**：在 DDE/UOS 上需使用 `QT_QPA_PLATFORM=xcb` 以正确渲染窗口。
 
 ## IPC 协议
 
-### C++ → Node.js（stdin）
+### 前端：C++ ↔ Node.js（行分隔 JSON，双向）
+
+**C++ → Node.js（stdin）**：
+
+| 消息类型 | 示例 | 说明 |
+|---------|------|------|
+| `call` | `{"type":"call","func":"build_ui","args":[]}` | 调用 WASM 导出函数 |
+| `import_result` | `{"type":"import_result","value":1}` | 返回 DTK 宿主回调结果 |
+| `read_memory` | `{"type":"read_memory","offset":512,"len":30}` | 读取 WASM 线性内存 |
+| `write_memory` | `{"type":"write_memory","offset":ptr,"hex":"..."}` | 写入 WASM 线性内存 |
+| `quit` | `{"type":"quit"}` | 通知子进程退出 |
+
+**Node.js → C++（stdout）**：
+
+| 消息类型 | 示例 | 说明 |
+|---------|------|------|
+| `import` | `{"type":"import","func":"dtk_create_label","args":[536,30],"str":"WASM-Powered Chat Client (DTK)"}` | DTK 宿主回调请求（`str` 为预读的字符串参数） |
+| `call_result` | `{"type":"call_result","value":0}` | WASM 导出函数调用结果 |
+| `call_result` (hex) | `{"type":"call_result","hex":"48656c6c6f"}` | 内存读取结果 |
+| `error` | `{"type":"error","error":"..."}` | 错误消息 |
+
+### 后端：C++ → Node.js（一次性 JSON）
+
+**请求**（stdin，完整 JSON）：
 ```json
-{"type":"call","func":"build_ui","args":[]}
-{"type":"import_result","value":1}
-{"type":"read_memory","offset":512,"len":30}
-{"type":"write_memory","offset":ptr,"hex":"..."}
+{
+  "wasm_path": "plugins/random_reply_plugin.wasm",
+  "action": "generate_reply",
+  "seed": 42
+}
 ```
 
-### Node.js → C++（stdout）
+**响应**（stdout，完整 JSON）：
 ```json
-{"type":"import","func":"dtk_create_label","args":[512,23],"str":"WASM-Powered Chat (DTK)"}
-{"type":"call_result","value":0}
-{"type":"call_result","hex":"48656c6c6f"}
+{"success": true, "result": "WASM plugins are awesome!"}
 ```
+
+## DTK 宿主函数
+
+WASM UI 插件从 `env` 模块导入以下函数（C++ `extern "C"` 声明，Emscripten 编译为 import）：
+
+| 函数 | 签名 | 说明 |
+|------|------|------|
+| `dtk_create_label` | `(ptr, len) → id` | 创建 DLabel（字符串指针, 字符串长度）→ 控件 ID |
+| `dtk_create_textedit` | `(readonly, _) → id` | 创建 DTextEdit（是否只读, 未使用）→ 控件 ID |
+| `dtk_create_lineedit` | `(ptr, len) → id` | 创建 DLineEdit（占位文本指针, 长度）→ 控件 ID |
+| `dtk_create_pushbutton` | `(ptr, len) → id` | 创建 DSuggestButton（按钮文本指针, 长度）→ 控件 ID |
+| `dtk_create_hbox` | `(flag, _) → id` | 创建布局（0=主垂直布局, 1=水平布局）→ 布局 ID |
+| `dtk_add_to_layout` | `(layoutId, widgetId) → 0` | 将控件/子布局添加到布局 |
+| `dtk_set_window_title` | `(ptr, len) → 0` | 设置窗口标题 |
+| `dtk_set_window_size` | `(width, height) → 0` | 设置窗口尺寸 |
+| `dtk_get_theme` | `() → theme` | 获取当前主题（0=浅色, 1=深色） |
+| `dtk_set_theme` | `(theme, _) → 0` | 设置主题 |
+| `dtk_append_message` | `(ptr, len) → 0` | 追加消息到显示区 |
+
+> `ptr`/`len` 参数指向 WASM 线性内存中的 UTF-8 字符串。
+> JS 端在发送 import 请求前预读这些字符串，通过 IPC 的 `str` 字段传递给 C++，
+> C++ 直接使用 `str` 而不需要回读 WASM 内存。
+
+## 运行流程
+
+### 启动流程
+
+```
+1. 服务器启动
+   server_main.cpp → ChatServer::start(12345)
+     → WasmPluginLoader 加载 random_reply_plugin.wasm（检查文件存在）
+     → QTcpServer::listen(12345)
+
+2. 客户端启动
+   dtk_client_main.cpp → DtkChatClient 构造函数
+     → WasmProcessBridge::load("plugins/chat_ui_plugin.wasm")
+         → QProcess 启动 node wasm_dtk_host.js
+         → Node 主线程创建 SharedArrayBuffer + Worker 线程
+         → Worker: WebAssembly.instantiate(wasm, {env: dtkFuncs})
+         → Worker: postMessage({type:'loaded'})
+         → 主线程: stderr 输出就绪信号
+         → C++ 等待 stderr 就绪信号
+     → callExport("build_ui")
+         → 14 次 import 往返（见上文 build_ui 执行序列）
+         → 每次往返: Worker → SAB → 主线程 → stdout → C++ → stdin → 主线程 → SAB → Worker
+         → C++ 在自己进程内 new DLabel/DTextEdit/... 并加入布局
+         → 返回 call_result
+     → applyThemeColors()
+     → QTimer 500ms 后 TCP 连接服务器
+```
+
+### 消息发送流程
+
+```
+用户输入文本 → 点击 Send
+  │
+  ├─ m_wasm->alloc(text.size())        ← IPC: call alloc → WASM bump allocator → 返回 ptr
+  ├─ m_wasm->writeString(ptr, text)    ← IPC: write_memory → 写入 WASM 线性内存
+  ├─ m_wasm->readString(ptr, size)     ← IPC: read_memory → 读回验证
+  ├─ appendMessage("[Me] " + wasmText) ← C++ 本地显示
+  └─ TCP 发送 {"text":"..."} 到服务器
+       │
+       └─ 服务器收到
+          ├─ 生成 seed = timestamp ⊕ counter × 2654435761 ⊕ msg_length
+          ├─ WasmPluginLoader::invoke("generate_reply", {seed})
+          │    → QProcess 启动 node wasm_runner.js
+          │    → Node 实例化 random_reply_plugin.wasm
+          │    → 调用 generate_reply(seed) → 返回回复指针
+          │    → 读取回复字符串 → {"success":true,"result":"..."}
+          └─ TCP 返回 {"text":"回复","echo":"原文","seed":种子}
+               │
+               └─ 客户端收到
+                  └─ appendMessage("[Server] " + text)
+```
+
+### 主题切换流程
+
+```
+右键菜单 → "Switch to Dark/Light Theme"
+  │
+  └─ toggleTheme()
+       ├─ m_wasm->callExport("toggle_theme")  ← IPC: call toggle_theme
+       │     │
+       │     └─ Worker 执行 WASM toggle_theme():
+       │          ├─ call dtk_get_theme          → import → C++ 返回当前主题
+       │          ├─ call dtk_set_theme(新值)    → import → C++ 切换主题
+       │          │    └─ C++ handleDtkHostCall:
+       │          │         ├─ DGuiApplicationHelper::setPaletteType()
+       │          │         └─ applyThemeColors()  ← 设置 DTextEdit 深色/浅色调色板+样式表
+       │          └─ 返回旧主题值
+       │
+       └─ appendMessage("[System] Theme switched to ...")
+```
+
+## 功能特性
+
+- **C++ 源码编译为 WASM**：插件源码是标准 C++，用 Emscripten 编译
+- **WASM 定义 UI**：整个 UI 布局由 WASM 插件通过调用 DTK 宿主函数创建控件
+- **WASM 消息处理**：消息通过 WASM 线性内存分配、写入、格式化
+- **WASM 后端**：服务器使用 WASM 插件生成随机回复
+- **进程隔离**：WASM 在独立进程中运行，插件崩溃不影响主程序
+- **DTK 依赖强制**：WASM 模块导入 11 个 DTK 宿主函数，无 DTK 则无法实例化
+- **无 libc 依赖**：手写字符串/内存函数，`-nostdlib` 编译
+- **右键上下文菜单**：复制、粘贴、另存为、主题切换
+- **深色/浅色主题**：通过右键菜单切换，由 WASM 插件驱动
+- **TCP 通信**：客户端连接服务器，发送消息，接收随机回复
+- **自动重连**：断线后客户端 3 秒自动重连
+- **后备 UI**：WASM 加载失败时用 C++ 直接创建相同 UI

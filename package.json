@@ -3,10 +3,7 @@
   "version": "1.0.0",
   "description": "WASM-powered Qt chat application with frontend and backend WASM plugin mechanisms",
   "private": true,
-  "dependencies": {
-    "wabt": "^1.0.39"
-  },
   "scripts": {
-    "build:plugins": "node scripts/build_plugins.js"
+    "build:plugins": "bash scripts/compile_plugins.sh"
   }
 }

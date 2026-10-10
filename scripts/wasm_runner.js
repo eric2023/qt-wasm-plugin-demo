@@ -6,15 +6,6 @@
  *
  * 由 ChatServer 通过 QProcess 调用。从 stdin 读取 JSON 请求，
  * 加载 Emscripten 编译的 WASM 插件，执行请求的函数，返回 JSON。
- *
- * 协议（一次性调用）：
- *   stdin:  { "wasm_path": "...", "action": "...", ... }
- *   stdout: { "success": true, ... }  |  { "success": false, "error": "..." }
- *
- * Actions:
- *   "generate_reply" — 后端插件：根据 seed 选择随机回复
- *       { "wasm_path": "plugins/random_reply_plugin.wasm", "action": "generate_reply", "seed": 42 }
- *       → { "success": true, "result": "Hello! Nice to meet you." }
  */
 
 const fs = require('fs');
@@ -40,8 +31,9 @@ async function handleRequest(req) {
 
     const wasmBinary = new Uint8Array(fs.readFileSync(wasmPath));
 
-    // 后端插件自包含，无 import
-    const { instance } = await WebAssembly.instantiate(wasmBinary, {});
+    // 后端插件自包含（无 import）
+    const result = await WebAssembly.instantiate(wasmBinary, {});
+    const instance = result.instance || result;
     const exports = instance.exports;
 
     switch (req.action) {
@@ -50,8 +42,8 @@ async function handleRequest(req) {
             const resultPtr = exports.generate_reply(seed);
             const replyLen = exports.get_reply_len(seed);
             const resultBytes = new Uint8Array(exports.memory.buffer, resultPtr, replyLen);
-            const result = Buffer.from(resultBytes).toString('utf8');
-            return { success: true, result: result };
+            const replyStr = Buffer.from(resultBytes).toString('utf8');
+            return { success: true, result: replyStr };
         }
         default:
             return { success: false, error: `Unknown action: ${req.action}` };

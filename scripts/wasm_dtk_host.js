@@ -52,16 +52,8 @@ if (!isMainThread) {
     const u8 = new Uint8Array(sab);
 
     async function main() {
-        // 加载 Emscripten 生成的 JS 胶水代码
-        const jsPath = path.join(wasmDir, wasmName + '.js');
         const wasmPath = path.join(wasmDir, wasmName + '.wasm');
 
-        // 读取 Emscripten JS 胶水代码
-        const glueCode = fs.readFileSync(jsPath, 'utf8');
-
-        // 创建 DTK 导入对象
-        // Emscripten 编译时通过 IMPORTED_FUNCTIONS 声明这些为 import
-        // 它们出现在 wasmModule 的 imports 中
         function readMemStr(ptr, len, memory) {
             if (!memory) return '';
             const bytes = new Uint8Array(memory.buffer, ptr, len);
@@ -127,13 +119,14 @@ if (!isMainThread) {
 
         let instance;
         try {
-            // 先尝试只用 env
-            instance = await WebAssembly.instantiate(wasmBinary, importObject);
+            const result = await WebAssembly.instantiate(wasmBinary, importObject);
+            instance = result.instance || result;
         } catch (e) {
             try {
-                instance = await WebAssembly.instantiate(wasmBinary, importObjectBoth);
+                const result = await WebAssembly.instantiate(wasmBinary, importObjectBoth);
+                instance = result.instance || result;
             } catch (e2) {
-                // 尝试自动检测 import 模块名
+                // 自动检测 import 模块名
                 const module = await WebAssembly.compile(wasmBinary);
                 const imports = WebAssembly.Module.imports(module);
                 const importMap = {};
@@ -141,7 +134,8 @@ if (!isMainThread) {
                     if (!importMap[imp.module]) importMap[imp.module] = {};
                     importMap[imp.module][imp.name] = dtkFuncs[imp.name] || makeDtkImport(imp.name, memoryGetter);
                 }
-                instance = await WebAssembly.instantiate(module, importMap);
+                const result = await WebAssembly.instantiate(module, importMap);
+                instance = result.instance || result;
             }
         }
 

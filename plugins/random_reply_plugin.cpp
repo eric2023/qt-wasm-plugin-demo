@@ -2,13 +2,13 @@
  * random_reply_plugin.cpp — 后端 WASM 插件源码（C++ 编译为 WASM）
  *
  * 用 Emscripten (emcc) 编译为 random_reply_plugin.wasm。
- * 自包含（无 DTK 依赖），导出 generate_reply(seed) 函数。
+ * 自包含（无外部依赖），导出 generate_reply(seed) 和 get_reply_len(seed)。
  *
  * 10 条预设回复，基于 seed % 10 选择。
+ * 使用手写字符串长度计算和内存复制，避免 libc 依赖。
  */
 
 #include <cstdint>
-#include <cstring>
 
 // 预设回复
 static const char* REPLIES[] = {
@@ -25,6 +25,22 @@ static const char* REPLIES[] = {
 };
 static const int REPLY_COUNT = 10;
 
+// 手写字符串长度（避免 strlen 导入）
+// __attribute__((noinline)) 防止编译器将其优化为 strlen 调用
+__attribute__((noinline, optnone))
+static uint32_t my_strlen(const char* s) {
+    uint32_t len = 0;
+    while (s[len]) len++;
+    return len;
+}
+
+// 手写内存复制（避免 memcpy 导入）
+static void my_memcpy(void* dst, const void* src, uint32_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
+}
+
 // 堆分配器
 static uint8_t* heap_base = nullptr;
 static uint32_t heap_offset = 0;
@@ -36,28 +52,27 @@ extern "C" __attribute__((visibility("default")))
 uint32_t generate_reply(uint32_t seed) {
     int index = (int)(seed % REPLY_COUNT);
     const char* reply = REPLIES[index];
-    uint32_t len = (uint32_t)strlen(reply);
+    uint32_t len = my_strlen(reply);
 
-    // 分配内存并复制回复
     if (!heap_base) {
-        heap_base = (uint8_t*)(__builtin_wasm_memory_size(0) * 65536);
+        uint32_t pages = (uint32_t)__builtin_wasm_memory_size(0);
+        heap_base = (uint8_t*)((uintptr_t)pages * 65536);
         heap_offset = 0;
         __builtin_wasm_memory_grow(0, 1);
     }
 
     uint32_t ptr = (uint32_t)(uintptr_t)(heap_base + heap_offset);
-    memcpy((void*)(uintptr_t)ptr, reply, len);
-    heap_offset += len + 1;  // +1 for null terminator
+    my_memcpy((void*)(uintptr_t)ptr, reply, len);
+    heap_offset += len + 1;
 
     return ptr;
 }
 
 /**
- * get_reply_len() — 返回最近一次 generate_reply 的回复长度。
- * 简化实现：每次调用重算。
+ * get_reply_len(seed) — 返回指定 seed 对应回复的长度。
  */
 extern "C" __attribute__((visibility("default")))
 uint32_t get_reply_len(uint32_t seed) {
     int index = (int)(seed % REPLY_COUNT);
-    return (uint32_t)strlen(REPLIES[index]);
+    return my_strlen(REPLIES[index]);
 }
