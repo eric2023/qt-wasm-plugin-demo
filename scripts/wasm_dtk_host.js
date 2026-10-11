@@ -272,6 +272,10 @@ if (!isMainThread) {
     });
 
     function pollImport() {
+        // 用 Atomics.wait 短超时等待 Worker 的 import 请求，避免 setImmediate 忙轮询导致 CPU 100%。
+        // 超时 10ms 后让出事件循环，处理 Worker 的 call_result 消息和 stdin 消息。
+        // Worker 调用 import 时设 TAG=1 + Atomics.notify → 本 wait 立即返回。
+        // Worker 完成 WASM 调用时发 postMessage(call_result) → 需要让出事件循环处理。
         if (Atomics.load(i32, TAG_OFFSET / 4) === 1) {
             const funcLen = i32[FUNCLEN_OFFSET / 4];
             const funcName = Buffer.from(u8.subarray(FUNC_OFFSET, FUNC_OFFSET + funcLen)).toString('utf8');
@@ -285,6 +289,7 @@ if (!isMainThread) {
             waitingImportResult = true;
             return;
         }
+        Atomics.wait(i32, TAG_OFFSET / 4, 0, 10);
         setImmediate(pollImport);
     }
 
