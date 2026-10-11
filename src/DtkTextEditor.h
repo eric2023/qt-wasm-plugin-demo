@@ -359,7 +359,10 @@ private:
             return (int32_t)fileName.toUtf8().size();
         }
         if (func == "dtk_read_file") {
-            // str = 文件路径, a1 = ptr (WASM 内存写入位置), a2 = maxlen
+            // str = 文件路径 (预读自 a1/a2)
+            // a3 = destPtr (WASM 内存写入位置) — Worker 用 result_str 复制到此处
+            // 注意: maxlen 是第 4 个参数, SAB 只有 3 个 arg 槽, 无法传递
+            // 但 RESULT_STR_MAX=64KB 已足够, WASM 分配 65536 字节缓冲区
             QFile file(str);
             if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
                 return -1;
@@ -368,7 +371,6 @@ private:
             file.close();
             outResultStr = QString::fromUtf8(content);
             int32_t len = (int32_t)content.size();
-            if (len > a2) len = a2;
             qDebug() << "[DTK Host] read_file:" << str << "bytes:" << content.size();
             return len;
         }

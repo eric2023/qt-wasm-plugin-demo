@@ -265,7 +265,16 @@ uint32_t alloc(uint32_t size) {
         uint32_t pages = (uint32_t)__builtin_wasm_memory_size(0);
         heap_base = (uint8_t*)((uintptr_t)pages * 65536);
         heap_offset = 0;
-        if (__builtin_wasm_memory_grow(0, (size + 65535) / 65536) == -1) {
+    }
+    // 检查是否有足够的内存，不够则增长
+    uint32_t needed = heap_offset + size;
+    uint32_t currentBytes = (uint32_t)__builtin_wasm_memory_size(0) * 65536;
+    uint32_t available = currentBytes > (uint32_t)(uintptr_t)heap_base
+        ? currentBytes - (uint32_t)(uintptr_t)heap_base : 0;
+    if (needed > available) {
+        uint32_t deficit = needed - available;
+        uint32_t pagesToGrow = (deficit + 65535) / 65536;
+        if (__builtin_wasm_memory_grow(0, pagesToGrow) == -1) {
             return 0;
         }
     }

@@ -55,7 +55,7 @@ const STR_FUNCS = new Set([
 
 // 带字符串参数且字符串在 a2/a3（而非 a1/a2）的函数
 const STR_AT_A2_FUNCS = new Set([
-    'dtk_set_label_text', 'dtk_set_editor_text'
+    'dtk_set_label_text'
 ]);
 
 // dtk_read_file 有两个字符串参数: path(a1/a2) 和 data(a3/不预读)
@@ -243,6 +243,7 @@ if (!isMainThread) {
 
     let workerReady = false;
     let waitingImportResult = false;
+    let pollActive = false;  // 防止 pollImport 重复调度
 
     function sendToParent(obj) {
         process.stdout.write(JSON.stringify(obj) + '\n');
@@ -287,6 +288,7 @@ if (!isMainThread) {
 
             sendToParent({ type: 'import', func: funcName, args: [a1, a2, a3], str: str });
             waitingImportResult = true;
+            pollActive = false;
             return;
         }
         Atomics.wait(i32, TAG_OFFSET / 4, 0, 10);
@@ -322,7 +324,7 @@ if (!isMainThread) {
                 Atomics.store(i32, TAG_OFFSET / 4, 0);
                 Atomics.notify(i32, TAG_OFFSET / 4, 1);
                 waitingImportResult = false;
-                setImmediate(pollImport);
+                if (!pollActive) { pollActive = true; setImmediate(pollImport); }
             }
             return;
         }
@@ -334,7 +336,7 @@ if (!isMainThread) {
 
         if (req.type === 'call' || req.type === 'read_memory' || req.type === 'write_memory') {
             worker.postMessage(req);
-            pollImport();
+            if (!pollActive) { pollActive = true; pollImport(); }
         } else if (req.type === 'quit') {
             worker.postMessage({ type: 'quit' });
             process.exit(0);
